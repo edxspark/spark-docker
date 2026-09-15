@@ -6,6 +6,7 @@ import asyncio
 import logging
 import traceback
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 from sqlalchemy import select
 
@@ -23,7 +24,14 @@ from app.pipeline.context import (
 )
 from app.pipeline.stages.acquire import stage_download, stage_probe, stage_subtitle
 from app.pipeline.stages.deliver import stage_metadata, stage_publish
-from app.pipeline.stages.localize import stage_align, stage_translate, stage_tts
+from app.pipeline.stages.localize import (
+    render_config_key,
+    stage_align,
+    stage_translate,
+    stage_tts,
+    translate_config_key,
+    tts_config_key,
+)
 from app.providers import build_all
 from app.providers.base import ProviderError
 from app.services.settings_store import settings_store
@@ -43,6 +51,19 @@ STAGES: list[tuple[str, StageFn]] = [
     ("metadata", stage_metadata),
     ("publish", stage_publish),
 ]
+
+
+def _render_inputs(state: ItemState) -> list[Path]:
+    """渲染成片所依赖的输入文件（任一比成片新，成片就算过期）。"""
+    paths = state.paths
+    candidates = [paths.video, paths.subtitle_zh, paths.subtitle_en]
+    candidates += [
+        paths.audio_dir / "voice_track.mp3",
+        paths.audio_dir / "mixed.m4a",
+    ]
+    if state.item.dubbed_audio_path:
+        candidates.append(settings.data_dir / state.item.dubbed_audio_path)
+    return candidates
 
 
 class TaskHandle:
@@ -200,7 +221,7 @@ class TaskRunner:
         try:
             for stage_name, stage_fn in STAGES:
                 ctx.reporter.raise_if_canceled()
-                if self._already_done(stage_name, state, item):
+                if self._already_done(stage_name, state, item, ctx):
                     await bump(item_id, ctx.overall_for(stage_name, 100))
                     continue
                 failed_stage = stage_name
@@ -247,7 +268,7 @@ class TaskRunner:
         except ProviderError as exc:
             raise ProviderError(f"{label}：{exc}") from exc
 
-    def _already_done(self, stage_name: str, state: ItemState, item: TaskItem) -> bool:
+    def _already_done(self, stage_name: str, state: ItemState, item: TaskItem, ctx: StageContext) -> bool:
         """断点续跑：已有产物则跳过已完成的阶段，避免重复下载/重复计费。"""
         paths = state.paths
         if stage_name == "probe":
@@ -265,11 +286,17 @@ class TaskRunner:
                 return bool(state.stats.get("asr_done"))
             return False
         if stage_name == "translate":
-            return paths.subtitle_zh.exists() and bool(state.cues_zh)
+            if not (paths.subtitle_zh.exists() and state.cues_zh):
+                return False
+            # 换了翻译服务/模型后，旧译文（可能是 mock 占位）必须重做
+            return (state.stats.get("translate") or {}).get("config_key") == translate_config_key(ctx)
         if stage_name == "tts":
             needed = len(state.cues_zh)
             if needed == 0:
                 return True
+            # 换了服务商/音色/语速后，旧分段音频必须重做（否则会把占位音频当真配音）
+            if (state.stats.get("tts") or {}).get("config_key") != tts_config_key(ctx):
+                return False
             existing = sum(
                 1
                 for i in range(needed)
@@ -277,7 +304,25 @@ class TaskRunner:
             )
             return existing == needed
         if stage_name == "align":
-            return paths.output.exists() and paths.output.stat().st_size > 0
+            if not (paths.output.exists() and paths.output.stat().st_size > 0):
+                return False
+            # 渲染参数变了要重渲染
+            if (state.stats.get("output") or {}).get("config_key") != render_config_key(ctx):
+                return False
+            # 关键：成片必须比它的所有输入都新。
+            # 否则「先跑过一次产出成片、之后才生成新字幕/新配音」的情况下，
+            # 会一直沿用旧成片——用户看到的就是「没有中文字幕也没有中文配音」。
+            try:
+                output_mtime = paths.output.stat().st_mtime
+            except OSError:
+                return False
+            for candidate in _render_inputs(state):
+                try:
+                    if candidate.exists() and candidate.stat().st_mtime > output_mtime:
+                        return False
+                except OSError:
+                    return False
+            return True
         if stage_name == "publish":
             return bool(item.publish_status) and item.publish_status not in {"", "publishing", "failed"}
         return False

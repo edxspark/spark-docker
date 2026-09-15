@@ -520,3 +520,70 @@ async def test_definitive_asr_failure_is_not_retried(prepared, sample_video, mon
     assert "未配置语音识别凭证" in (stats.get("asr_error") or "")
     assert item.output_path
     assert any("语音识别不可用" in log.message for log in logs)
+
+
+async def test_stale_output_is_re_rendered(prepared, sample_video, sample_srt):
+    """回归：成片比输入旧时必须重渲染。
+
+    实际事故：任务先跑出成片（当时无字幕，保留原声），之后才生成新的字幕与配音，
+    但 align 阶段被判为「已完成」，一直沿用旧成片，用户看到的就是
+    「视频没有中文字幕也没有中文配音」。
+    """
+    if not (await _ffmpeg_ok()):
+        pytest.skip("未安装 ffmpeg")
+
+    import os
+
+    task_id = await _create_task("https://www.youtube.com/watch?v=stale001")
+    await _run_to_completion(task_id)
+
+    task, items, _ = await _load(task_id)
+    assert task.status == TaskStatus.SUCCEEDED.value, item_errors(items)
+    item = items[0]
+    output = settings.data_dir / item.output_path
+    assert output.exists()
+    first_mtime = output.stat().st_mtime
+
+    # 人为把成片的修改时间改早，模拟「成片早于输入产物」
+    older = first_mtime - 600
+    os.utime(output, (older, older))
+
+    await _run_to_completion(task_id)
+
+    task, items, _ = await _load(task_id)
+    item = items[0]
+    output = settings.data_dir / item.output_path
+    assert output.stat().st_mtime > older, "成片没有因为过期而被重新渲染"
+
+
+async def test_provider_change_invalidates_cached_artifacts(prepared, sample_video, sample_srt):
+    """回归：翻译/配音服务商变化后，旧的占位产物必须重做。"""
+    if not (await _ffmpeg_ok()):
+        pytest.skip("未安装 ffmpeg")
+
+    from sqlalchemy import select
+
+    task_id = await _create_task("https://www.youtube.com/watch?v=stale002")
+    await _run_to_completion(task_id)
+
+    async with SessionLocal() as session:
+        item = (
+            await session.execute(select(TaskItem).where(TaskItem.task_id == task_id))
+        ).scalars().first()
+        assert item is not None
+        # 模拟「上次是别的配置产出的」：把指纹改掉
+        stats = dict(item.stats or {})
+        stats["translate"] = {**stats.get("translate", {}), "config_key": "something-else"}
+        stats["tts"] = {**stats.get("tts", {}), "config_key": "something-else"}
+        stats.pop("output", None)
+        item.stats = stats
+        await session.commit()
+
+    await _run_to_completion(task_id)
+
+    task, items, _ = await _load(task_id)
+    item = items[0]
+    stats = item.stats or {}
+    assert stats["translate"]["config_key"] != "something-else", "翻译没有被重做"
+    assert stats["tts"]["config_key"] != "something-else", "配音没有被重做"
+    assert stats["output"].get("config_key"), "成片缺少配置指纹"

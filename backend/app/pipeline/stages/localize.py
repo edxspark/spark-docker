@@ -29,8 +29,11 @@ async def stage_translate(ctx: StageContext, state: ItemState) -> None:
     hint = state.item.title or ""
     if ctx.config.translator.get("provider") == "mock":
         await ctx.reporter.log(
-            "当前为 Mock 翻译（未配置 DeepSeek Key），译文仅供流程验证", level="warning",
-            stage="translate", item_id=state.item.id,
+            "当前翻译服务为 Mock：译文是占位文本，不能直接发布。"
+            "如需真实译文，请在「系统配置 → 翻译」把服务改为 DeepSeek 并填写 API Key（凭证已填写时也要切换服务商）",
+            level="warning",
+            stage="translate",
+            item_id=state.item.id,
         )
 
     try:
@@ -52,6 +55,8 @@ async def stage_translate(ctx: StageContext, state: ItemState) -> None:
 
     usage = result.usage or {}
     state.stats["translate"] = {
+        # 配置指纹：换了翻译服务/模型后，旧译文必须视为无效
+        "config_key": translate_config_key(ctx),
         "sentences": len(state.cues_zh),
         "source_chars": sum(len(t) for t in texts),
         "target_chars": sum(len(c.text) for c in state.cues_zh),
@@ -100,11 +105,16 @@ async def stage_tts(ctx: StageContext, state: ItemState) -> None:
     segments: list[tuple[float, float, Path] | None] = [None] * total
     cached_count = 0
     characters = 0
+    tts_config_changed = (state.stats.get("tts") or {}).get("config_key") != tts_config_key(ctx)
 
     if ctx.config.tts.get("provider") == "mock":
         await ctx.reporter.log(
-            "当前为 Mock 语音合成（未配置阿里云凭证），生成的是等长静音占位音轨",
-            level="warning", stage="tts", item_id=state.item.id,
+            "当前语音合成服务为 Mock：产出的是静音占位音轨，成片会几乎没有配音。"
+            "如需真实配音，请在「系统配置 → 语音合成」把服务改为「阿里云智能语音交互」"
+            "（凭证已填写时也要切换服务商）",
+            level="warning",
+            stage="tts",
+            item_id=state.item.id,
         )
 
     async def worker(index: int, cue: Cue) -> None:
@@ -112,8 +122,11 @@ async def stage_tts(ctx: StageContext, state: ItemState) -> None:
         ctx.reporter.raise_if_canceled()
         async with semaphore:
             target = state.paths.audio_dir / f"seg_{index:04d}.mp3"
-            # 断点续跑：已存在的分段直接复用，避免重复计费
-            if target.exists() and target.stat().st_size > 0:
+            # 断点续跑：已存在的分段直接复用，避免重复计费。
+            # 但配置指纹变了（例如从 mock 换成阿里云真实配音）就必须重合成，
+            # 否则会把上一次的占位音频当成真实配音用下去。
+            reusable = target.exists() and target.stat().st_size > 0 and not tts_config_changed
+            if reusable:
                 async with lock:
                     cached_count += 1
                     completed += 1
@@ -138,6 +151,8 @@ async def stage_tts(ctx: StageContext, state: ItemState) -> None:
 
     state.voice_segments = [seg for seg in segments if seg is not None]
     state.stats["tts"] = {
+        # 配置指纹：换了服务商/音色/语速后，旧分段音频必须视为无效
+        "config_key": tts_config_key(ctx),
         "segments": len(state.voice_segments),
         "characters": characters,
         "cached_segments": cached_count,
@@ -285,6 +300,7 @@ async def stage_align(ctx: StageContext, state: ItemState) -> None:
 
     out_media = await ffmpeg_utils.probe(state.paths.output)
     state.stats["output"] = {
+        "config_key": render_config_key(ctx),
         "duration": round(out_media.duration, 2),
         "resolution": f"{out_media.width}x{out_media.height}",
         "size_mb": round(state.paths.output.stat().st_size / 1024 / 1024, 2),
@@ -307,4 +323,35 @@ async def stage_align(ctx: StageContext, state: ItemState) -> None:
         f"{state.stats['output']['resolution']}）",
         stage="align",
         item_id=state.item.id,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# 配置指纹：用于判断已有产物是否仍然有效
+#
+# 背景（真实事故）：把翻译/配音从 mock 切换为真实服务后，断点续跑仍然复用了
+# 上一次的占位译文与静音音频，用户拿到的成片「有中文字幕但没声音」。
+# 产物必须与产出它的配置绑定，配置变了就要重做。
+# --------------------------------------------------------------------------------------
+
+
+def translate_config_key(ctx: StageContext) -> str:
+    cfg = ctx.config.merged("translator")
+    return f"{cfg.get('provider')}:{cfg.get('model')}:{cfg.get('style_prompt', '')[:40]}"
+
+
+def tts_config_key(ctx: StageContext) -> str:
+    cfg = ctx.config.merged("tts")
+    return (
+        f"{cfg.get('provider')}:{cfg.get('voice')}:{cfg.get('speech_rate')}:"
+        f"{cfg.get('sample_rate')}:{cfg.get('volume')}"
+    )
+
+
+def render_config_key(ctx: StageContext) -> str:
+    cfg = ctx.config.merged("video")
+    return (
+        f"{cfg.get('target_aspect')}:{cfg.get('burn_subtitles')}:{cfg.get('keep_bgm')}:"
+        f"{cfg.get('bgm_volume')}:{cfg.get('voice_volume')}:{cfg.get('max_speedup')}:"
+        f"{cfg.get('subtitle_font_size')}:{cfg.get('subtitle_font_name')}"
     )
