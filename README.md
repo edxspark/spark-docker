@@ -34,12 +34,41 @@ YouTube 链接
 ### 启动
 
 ```bash
-# 生产形态：构建前端，后端单端口托管 → http://127.0.0.1:8720
+# 生产形态：构建前端 → 后端单端口托管（含 API 与 WebSocket）
+#   → http://127.0.0.1:8720
 ./scripts/start.sh
 
-# 开发形态：后端热重载 :8720 + Vite dev server :5173 → http://localhost:5173
+# 开发形态：后端热重载 + Vite dev server（改代码即时生效）
+#   → http://localhost:5173
 ./scripts/dev.sh
 ```
+
+两个脚本都会自动完成环境准备，无需手动建虚拟环境或装依赖：
+
+1. 探测 `node` / `npm`（PATH → `$NVM_DIR` → `~/.nvm/versions/node/*/bin`，取版本最高者）与 `ffmpeg`
+2. 缺失时创建 `backend/.venv`（Python 3.12）并安装依赖
+3. 缺失时执行 `npm install`
+4. 生产形态额外执行前端构建 `npm run build`
+5. 端口被占用时**明确报错并列出占用进程**，不会静默失败
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `SPARK_PORT` | `8720` | 后端端口 |
+| `VITE_PORT` | `5173` | 前端 dev server 端口（仅 `dev.sh`） |
+
+```bash
+# 换端口启动
+SPARK_PORT=9000 ./scripts/start.sh
+
+# 传递给 uvicorn 的额外参数
+./scripts/start.sh --reload
+
+# 停止服务：前台运行时 Ctrl+C
+kill $(lsof -nP -iTCP:8720 -sTCP:LISTEN -t)
+```
+
+> 开发形态下 Vite 会把 `/api`（含 WebSocket）代理到 `SPARK_PORT` 指定的后端，
+> 改端口时两个服务会保持一致，无需手动改 `vite.config.ts`。
 
 ### 离线自检（不需要任何密钥）
 
@@ -50,7 +79,7 @@ cd backend && .venv/bin/python ../scripts/verify_pipeline.py
 ```
 
 该脚本会用 ffmpeg 生成一段测试视频与英文假字幕，跑完整条流水线（Mock 翻译 / Mock 配音 / Mock 发布），
-输出各阶段明细、成片路径，并抽取两帧便于肉眼检查字幕效果。
+输出各阶段明细、成片路径，并抽取两帧便于肉眼检查字幕效果。可用 `--out <目录>` 指定产物目录、`--aspect 9:16` 指定画面比例。
 
 ### 运行测试
 

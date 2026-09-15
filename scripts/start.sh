@@ -1,27 +1,39 @@
 #!/usr/bin/env bash
-# 一键启动（生产形态）：构建前端 → 用后端单端口托管。
-# 访问 http://127.0.0.1:8720
+# 生产形态启动：构建前端 → 后端单端口托管（含 API 与 WebSocket）。
+#
+#   ./scripts/start.sh              # 默认 http://127.0.0.1:8720
+#   SPARK_PORT=9000 ./scripts/start.sh
+#   ./scripts/start.sh --reload     # 额外参数透传给 uvicorn
+#
+# 首次运行会自动创建虚拟环境并安装依赖，随后每次启动只做前端增量构建。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export PATH="$HOME/.nvm/versions/node/v24.17.0/bin:/opt/homebrew/bin:$PATH"
+# shellcheck source=./_common.sh
+. "$ROOT/scripts/_common.sh"
 
 PORT="${SPARK_PORT:-8720}"
 
-echo "==> 检查后端虚拟环境"
-if [ ! -x "$ROOT/backend/.venv/bin/python" ]; then
-  echo "    未找到 backend/.venv，正在创建（需要 uv：brew install uv）"
-  (cd "$ROOT/backend" && uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e .)
+echo "==> 环境检查"
+require_node
+check_ffmpeg
+
+if port_in_use "$PORT"; then
+  echo "✗ 端口 $PORT 已被占用。请先停止占用进程，或换端口："
+  echo "    SPARK_PORT=9000 ./scripts/start.sh"
+  echo "  当前占用："
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sed 's/^/    /' || true
+  exit 1
 fi
 
-echo "==> 检查前端依赖"
-if [ ! -d "$ROOT/frontend/node_modules" ]; then
-  (cd "$ROOT/frontend" && npm install)
-fi
+ensure_backend_venv "$ROOT"
+ensure_frontend_deps "$ROOT"
 
 echo "==> 构建前端"
 (cd "$ROOT/frontend" && npm run build)
 
-echo "==> 启动服务 http://127.0.0.1:$PORT"
+echo "==> 启动服务：http://127.0.0.1:$PORT"
+echo "    接口文档：http://127.0.0.1:$PORT/docs"
+echo "    停止服务：Ctrl+C"
 cd "$ROOT/backend"
 exec .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port "$PORT" "$@"
