@@ -1,6 +1,7 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import type {
+  CancelAllResult,
   CreateTaskPayload,
   DouyinAccount,
   Page,
@@ -64,6 +65,18 @@ export const taskApi = {
     http.get<TaskLog[]>(`/tasks/${id}/logs`, { params }).then((r) => r.data),
 
   cancel: (id: number) => http.post<{ message: string }>(`/tasks/${id}/cancel`).then((r) => r.data),
+
+  /** 取消所有未结束的任务。includePaused=false 时保留已暂停的任务 */
+  cancelAll: (includePaused = true) =>
+    http
+      .post<CancelAllResult>('/tasks/cancel-all', null, { params: { include_paused: includePaused } })
+      .then((r) => r.data),
+
+  /** 仅取「未结束任务」的总数，用于按钮角标（page_size=1 只为了拿 total） */
+  activeCount: () =>
+    http
+      .get<Page<Task>>('/tasks', { params: { status: 'pending,running,paused', page_size: 1 } })
+      .then((r) => r.data.total),
 
   retry: (id: number, onlyFailed = true) =>
     http

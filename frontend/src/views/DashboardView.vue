@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import * as echarts from 'echarts'
 import { settingsApi, statsApi, taskApi } from '@/api'
-import type { RuntimeInfo, StatsOverview } from '@/types'
+import type { RuntimeInfo, StatsOverview, Task } from '@/types'
 import StatusTag from '@/components/StatusTag.vue'
 import {
   formatDateTime,
@@ -19,6 +19,7 @@ const loading = ref(true)
 const overview = ref<StatsOverview | null>(null)
 const runtime = ref<RuntimeInfo | null>(null)
 
+const cancelingAll = ref(false)
 const quickUrl = ref('')
 const quickProbing = ref(false)
 const quickCreating = ref(false)
@@ -171,6 +172,49 @@ function resizeChart() {
   chart?.resize()
 }
 
+async function handleCancelAll() {
+  let targets: Task[] = []
+  let totalActive = 0
+  try {
+    const data = await taskApi.list({ status: 'pending,running,paused', page: 1, page_size: 100 })
+    targets = data.items
+    totalActive = data.total
+  } catch {
+    return
+  }
+  if (!totalActive) {
+    ElMessage.info('当前没有需要取消的任务')
+    await load()
+    return
+  }
+  const running = targets.filter((t) => t.status === 'running').length
+  const preview = targets
+    .slice(0, 5)
+    .map((t) => `· #${t.id} ${t.title || shortUrl(t.source_url, 28)}`)
+    .join('\n')
+  const more = totalActive > 5 ? `\n… 另有 ${totalActive - 5} 个` : ''
+  try {
+    await ElMessageBox.confirm(
+      `将取消 ${totalActive} 个未结束的任务${running ? `（其中 ${running} 个正在执行）` : ''}：\n\n${preview}${more}\n\n` +
+        '正在执行的任务会在当前阶段结束后停止；已完成的成片与字幕不会被删除。',
+      '取消所有任务',
+      { type: 'warning', confirmButtonText: '全部取消', cancelButtonText: '返回', customClass: 'cancel-all-confirm' },
+    )
+  } catch {
+    return
+  }
+  cancelingAll.value = true
+  try {
+    const result = await taskApi.cancelAll(true)
+    ElMessage.success(result.message)
+    await load()
+  } catch {
+    /* 拦截器已提示 */
+  } finally {
+    cancelingAll.value = false
+  }
+}
+
 async function handleProbe() {
   const url = quickUrl.value.trim()
   if (!url) {
@@ -242,7 +286,17 @@ onBeforeUnmount(() => {
           YouTube 视频 → 下载 → 翻译 → 配音 → 发布抖音，全流程自动化。粘贴链接即可开始。
         </p>
       </div>
-      <el-button type="primary" :icon="'Plus'" @click="router.push('/create')">新建搬运任务</el-button>
+      <div class="head-actions">
+        <el-button
+          v-if="(overview?.running_tasks ?? 0) > 0"
+          :icon="'CircleClose'"
+          :loading="cancelingAll"
+          @click="handleCancelAll"
+        >
+          全部取消（{{ overview?.running_tasks }}）
+        </el-button>
+        <el-button type="primary" :icon="'Plus'" @click="router.push('/create')">新建搬运任务</el-button>
+      </div>
     </div>
 
     <!-- 快捷开始 -->
@@ -382,6 +436,12 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 .quick-panel {
   margin-bottom: 16px;
 }

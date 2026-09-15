@@ -77,6 +77,15 @@ export interface TaskDetail extends Task {
   items: TaskItem[]
 }
 
+export interface CancelAllResult {
+  ok: boolean
+  canceled: number
+  running_signalled: number
+  paused_excluded: number
+  task_ids: number[]
+  message: string
+}
+
 export interface TaskLog {
   id: number
   task_id: number

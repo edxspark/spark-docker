@@ -13,6 +13,9 @@ const router = useRouter()
 const loading = ref(false)
 const rows = ref<Task[]>([])
 const total = ref(0)
+/** 未结束任务数（服务端统计，不受分页影响） */
+const activeCount = ref(0)
+const cancelingAll = ref(false)
 
 const query = reactive({
   status: [] as string[],
@@ -32,7 +35,7 @@ const sourceLabel: Record<string, string> = {
   channel: '频道',
 }
 
-const hasActive = computed(() => rows.value.some((row) => row.status === 'running' || row.status === 'pending'))
+const hasActive = computed(() => activeCount.value > 0)
 let timer: number | null = null
 
 async function load() {
@@ -51,6 +54,12 @@ async function load() {
     total.value = 0
   } finally {
     loading.value = false
+  }
+  // 单独统计未结束任务数，用于「全部取消」按钮的状态与角标
+  try {
+    activeCount.value = await taskApi.activeCount()
+  } catch {
+    activeCount.value = 0
   }
 }
 
@@ -77,6 +86,61 @@ async function cancel(row: Task) {
     load()
   } catch {
     /* 拦截器已提示 */
+  }
+}
+
+async function cancelAll() {
+  // 先取回受影响的任务，让用户在确认框里看到具体会取消哪些，而不是只看到一个数字
+  let targets: Task[] = []
+  let totalActive = 0
+  try {
+    const data = await taskApi.list({ status: 'pending,running,paused', page: 1, page_size: 100 })
+    targets = data.items
+    totalActive = data.total
+  } catch {
+    return
+  }
+
+  if (!totalActive) {
+    ElMessage.info('当前没有需要取消的任务')
+    activeCount.value = 0
+    return
+  }
+
+  const running = targets.filter((t) => t.status === 'running').length
+  const preview = targets
+    .slice(0, 5)
+    .map((t) => `· #${t.id} ${t.title || shortUrl(t.source_url, 28)}`)
+    .join('\n')
+  const more = totalActive > 5 ? `\n… 另有 ${totalActive - 5} 个` : ''
+
+  try {
+    await ElMessageBox.confirm(
+      `将取消 ${totalActive} 个未结束的任务${running ? `（其中 ${running} 个正在执行）` : ''}：\n\n${preview}${more}\n\n` +
+        '正在执行的任务会在当前阶段结束后停止；已完成的成片与字幕不会被删除。',
+      '取消所有任务',
+      {
+        type: 'warning',
+        confirmButtonText: '全部取消',
+        cancelButtonText: '返回',
+        // 用 white-space: pre-line 保留换行，避免标题挤成一行
+        customClass: 'cancel-all-confirm',
+      },
+    )
+  } catch {
+    return
+  }
+
+  cancelingAll.value = true
+  try {
+    const result = await taskApi.cancelAll(true)
+    ElMessage.success(result.message)
+    query.page = 1
+    await load()
+  } catch {
+    /* 拦截器已提示 */
+  } finally {
+    cancelingAll.value = false
   }
 }
 
@@ -139,7 +203,19 @@ onBeforeUnmount(() => {
         <h2 class="page-title">搬运管理</h2>
         <p class="page-subtitle">查看所有任务进度、重试失败项、管理产物与发布结果。</p>
       </div>
-      <el-button type="primary" :icon="'Plus'" @click="router.push('/create')">新建搬运任务</el-button>
+      <div class="head-actions">
+        <el-badge :value="activeCount" :hidden="!activeCount" type="warning">
+          <el-button
+            :icon="'CircleClose'"
+            :loading="cancelingAll"
+            :disabled="!activeCount"
+            @click="cancelAll"
+          >
+            全部取消
+          </el-button>
+        </el-badge>
+        <el-button type="primary" :icon="'Plus'" @click="router.push('/create')">新建搬运任务</el-button>
+      </div>
     </div>
 
     <div class="panel filter-panel">
@@ -285,6 +361,12 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
 .filter-panel {
   display: flex;
   align-items: center;

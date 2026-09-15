@@ -221,29 +221,109 @@ async def cancel_task(task_id: int, session: AsyncSession = Depends(get_session)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
 
-    canceled = await task_runner.cancel(task_id)
-    if not canceled and task.status not in (TaskStatus.PENDING.value, TaskStatus.RUNNING.value):
-        raise HTTPException(status_code=400, detail=f"任务当前状态为 {task.status}，无需取消")
-    if not canceled:
-        # 未在执行（排队中）：任务与尚未开始的条目一起标记为已取消，
-        # 否则条目会停留在 pending，导致「重试失败项」无对象可选。
-        task.status = TaskStatus.CANCELED.value
-        task.message = "已取消（未开始执行）"
-        task.finished_at = datetime.now()
-        items = (
-            await session.execute(
-                select(TaskItem).where(
-                    TaskItem.task_id == task_id,
-                    TaskItem.status.in_([TaskStatus.PENDING.value, TaskStatus.RUNNING.value]),
+    signalled = await _cancel_one(session, task)
+    return MessageOut(message="已发送取消指令，正在等待当前阶段结束…" if signalled else "任务已取消")
+
+
+@router.post("/cancel-all")
+async def cancel_all_tasks(
+    include_paused: bool = Query(default=True, description="是否一并取消已暂停的任务"),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """一键取消所有未结束的任务（新增/执行中/已暂停）。
+
+    返回被影响的明细，便于前端如实告知用户「发出了几条取消指令、直接标记了几条」。
+    """
+    wanted = [TaskStatus.PENDING.value, TaskStatus.RUNNING.value]
+    if include_paused:
+        wanted.append(TaskStatus.PAUSED.value)
+
+    tasks = (
+        await session.execute(select(Task).where(Task.status.in_(wanted)).order_by(Task.id))
+    ).scalars().all()
+
+    if not tasks:
+        return {
+            "ok": True,
+            "canceled": 0,
+            "running_signalled": 0,
+            "paused_excluded": 0,
+            "task_ids": [],
+            "message": "当前没有需要取消的任务",
+        }
+
+    signalled = 0
+    for task in tasks:
+        if await _cancel_one(session, task):
+            signalled += 1
+
+    paused_excluded = 0
+    if not include_paused:
+        paused_excluded = int(
+            (
+                await session.execute(
+                    select(func.count(Task.id)).where(Task.status == TaskStatus.PAUSED.value)
                 )
+            ).scalar()
+            or 0
+        )
+
+    parts = []
+    if signalled:
+        parts.append(f"{signalled} 个执行中的任务已发送取消指令（待当前阶段结束后停止）")
+    direct = len(tasks) - signalled
+    if direct:
+        parts.append(f"{direct} 个排队中的任务已直接取消")
+    if paused_excluded:
+        parts.append(f"{paused_excluded} 个已暂停的任务未处理")
+
+    return {
+        "ok": True,
+        "canceled": len(tasks),
+        "running_signalled": signalled,
+        "paused_excluded": paused_excluded,
+        "task_ids": [task.id for task in tasks],
+        "message": "；".join(parts) or "已取消",
+    }
+
+
+async def _cancel_one(session: AsyncSession, task: Task) -> bool:
+    """取消单个任务。
+
+    返回 True 表示「任务正在执行，已发出取消指令（异步生效）」；
+    返回 False 表示「任务尚未开始，已直接标记为已取消」。
+    """
+    signalled = await task_runner.cancel(task.id)
+    if signalled:
+        return True
+
+    if task.status not in (
+        TaskStatus.PENDING.value,
+        TaskStatus.RUNNING.value,
+        TaskStatus.PAUSED.value,
+    ):
+        # 已结束的任务不该走到这里；调用方负责过滤
+        return False
+
+    # 未在执行：任务与尚未开始的条目一起标记为已取消，
+    # 否则条目会停留在 pending，导致「重试失败项」无对象可选。
+    task.status = TaskStatus.CANCELED.value
+    task.message = "已取消"
+    task.finished_at = datetime.now()
+    items = (
+        await session.execute(
+            select(TaskItem).where(
+                TaskItem.task_id == task.id,
+                TaskItem.status.in_([TaskStatus.PENDING.value, TaskStatus.RUNNING.value]),
             )
-        ).scalars().all()
-        for item in items:
-            item.status = TaskStatus.CANCELED.value
-            item.message = "已取消"
-        await session.commit()
-        await event_bus.emit(task_id, "task.finished", status=task.status, message=task.message)
-    return MessageOut(message="已发送取消指令，正在等待当前阶段结束…" if canceled else "任务已取消")
+        )
+    ).scalars().all()
+    for item in items:
+        item.status = TaskStatus.CANCELED.value
+        item.message = "已取消"
+    await session.commit()
+    await event_bus.emit(task.id, "task.finished", status=task.status, message=task.message)
+    return False
 
 
 @router.post("/{task_id}/retry", response_model=TaskDetailOut)

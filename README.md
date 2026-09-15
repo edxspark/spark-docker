@@ -177,6 +177,19 @@ cd backend && .venv/bin/python ../scripts/verify_pipeline.py --no-subtitle
 5. **搬运管理** 中查看所有任务、取消、重试失败项、按任务清理文件
 6. **任务历史** 中检索、复跑、导出 CSV
 
+### 批量取消
+
+「搬运管理」页右上角的 **全部取消** 按钮可一键停止所有未结束的任务：
+
+- 按钮带角标显示未结束任务数（排队中 + 执行中 + 已暂停），无任务时自动禁用
+- 确认框会列出**具体要取消哪些任务**（含 ID 与标题），而不是只给一个数字
+- 排队中的任务直接标记为已取消，条目同步取消（否则无法用「重试失败项」找回）
+- **执行中的任务只发送取消指令**，等当前阶段跑完才真正停止——不会留下半截文件
+- 已完成的成片、字幕、配音都不会被删除
+- 已暂停的任务默认一并取消，接口也支持 `include_paused=false` 保留它们
+
+对应接口：`POST /api/tasks/cancel-all?include_paused=true`
+
 ### 断点续跑
 
 所有阶段产物落盘后即成为续跑依据：
@@ -288,7 +301,8 @@ spark-video-tools/
 | GET | `/api/tasks` | 任务列表（状态、关键词、分页） |
 | GET | `/api/tasks/{id}` | 任务详情（含条目） |
 | GET | `/api/tasks/{id}/logs` | 任务日志 |
-| POST | `/api/tasks/{id}/cancel` | 取消任务 |
+| POST | `/api/tasks/{id}/cancel` | 取消单个任务 |
+| POST | `/api/tasks/cancel-all` | 取消所有未结束的任务 |
 | POST | `/api/tasks/{id}/retry` | 重试（仅失败项 / 全部重跑） |
 | DELETE | `/api/tasks/{id}` | 删除任务（可选删文件） |
 | POST | `/api/tasks/{id}/items/{iid}/publish` | 手动发布某条目 |
