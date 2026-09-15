@@ -824,20 +824,25 @@ class DouyinPublisher(BasePublisher):
         用户只能看到成片却看不出原因，因此这里把结论如实返回给调用方记录。
         """
         cover = Path(request.cover_path) if request.cover_path else None
-        if cover is None or not cover.exists():
+        if cover is None:
+            logger.warning("本次发布没有指定封面文件，将使用平台推荐封面（视频帧）")
             return await self._use_recommended_cover(page)
+        if not cover.exists():
+            logger.error("封面文件不存在：%s —— 将退回平台推荐封面（视频帧）", cover)
+            return await self._use_recommended_cover(page)
+        logger.info("准备上传本地封面：%s（%.0f KB）", cover.name, cover.stat().st_size / 1024)
 
         # 1) 打开封面弹窗（引导浮层会拦截点击，先清掉）
         await _dismiss_onboarding(page)
         if not await self._open_cover_dialog(page):
             await _dismiss_onboarding(page)
             if not await self._open_cover_dialog(page):
-                logger.warning("封面弹窗打不开，改用平台推荐封面")
+                logger.error("封面弹窗打不开，本地封面未能上传，将退回平台推荐封面（视频帧）")
                 return await self._use_recommended_cover(page)
 
         modal = page.locator(COVER_MODAL_SELECTOR).first
         if await modal.count() == 0:
-            logger.warning("未找到封面弹窗容器，改用平台推荐封面")
+            logger.error("未找到封面弹窗容器，本地封面未能上传，将退回平台推荐封面（视频帧）")
             return await self._use_recommended_cover(page)
 
         # 2) 定位「上传封面」的输入框。
@@ -850,7 +855,7 @@ class DouyinPublisher(BasePublisher):
         if await upload.count() == 0:
             upload = modal.locator('input[type="file"]').last
         if await upload.count() == 0:
-            logger.warning("封面弹窗里没有找到上传入口，改用平台推荐封面")
+            logger.error("封面弹窗里没有找到上传入口，本地封面未能上传，将退回平台推荐封面（视频帧）")
             return await self._use_recommended_cover(page)
 
         # 3) 优先设置竖版封面（抖音推荐竖屏），弹窗默认就在该页
@@ -862,15 +867,22 @@ class DouyinPublisher(BasePublisher):
         except Exception:  # noqa: BLE001 - 已在目标页时点击会失败，忽略
             pass
 
+        # 记录上传前的封面预览状态，用于确认这次确实换掉了
+        before_src = await self._cover_preview_src(page)
         await upload.set_input_files(str(cover))
         await page.wait_for_timeout(3000)
+        after_src = await self._cover_preview_src(page)
+        logger.info(
+            "封面已提交到上传框：预览图 %s",
+            "已更新" if (after_src and after_src != before_src) else "未检测到变化（继续等待处理）",
+        )
 
         # 4) 等「完成」解禁：图片处理完之前它是 disabled，点了无效
         done = modal.get_by_role("button", name="完成", exact=True).first
         if await done.count() == 0:
             done = modal.locator('button:has-text("完成")').first
         if await done.count() == 0:
-            logger.warning("封面弹窗里没有「完成」按钮，改用平台推荐封面")
+            logger.error("封面弹窗里没有「完成」按钮，本地封面未能上传，将退回平台推荐封面（视频帧）")
             return await self._use_recommended_cover(page)
 
         if not await _wait_until_enabled(done, timeout=20000):
@@ -896,6 +908,18 @@ class DouyinPublisher(BasePublisher):
             await _dismiss_overlays(page)
         logger.info("自定义封面上传完成：%s", cover.name)
         return True
+
+    async def _cover_preview_src(self, page) -> str:
+        """取封面预览图的 src，用于判断封面上传后预览是否真的变了。"""
+        try:
+            return await page.evaluate(
+                """() => {
+                    const img = document.querySelector('[class*="cover-"] img, [class*="cover"] img');
+                    return img ? (img.currentSrc || img.src || '').slice(0, 200) : '';
+                }"""
+            )
+        except Exception:  # noqa: BLE001
+            return ""
 
     async def _use_recommended_cover(self, page) -> bool:
         """兜底：使用抖音推荐的封面帧，至少不会是没有封面的黑底。"""

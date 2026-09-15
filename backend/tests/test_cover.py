@@ -266,3 +266,56 @@ class TestGenerativeBackground:
         generate_cover(video=sample_video, title="截图底图", tags=[], out_path=out,
                        style=CoverStyle(width=1080, height=1920, background="frame"))
         assert out.exists()
+
+
+class TestCoverUploadDiagnostics:
+    """封面没上传成功时，必须能查清原因。
+
+    事故：发布出去的作品用了视频帧而不是本地设计的封面。原实现的兜底
+    （退回平台推荐封面）全程只有 warning，甚至完全静默，
+    用户在浏览器里只看到「用了视频截图」，无从判断卡在哪一步。
+    """
+
+    def test_every_fallback_logs_a_reason(self):
+        import inspect
+
+        from app.providers.publisher.douyin import DouyinPublisher
+
+        source = inspect.getsource(DouyinPublisher._set_cover)
+        # 每个降级分支都要有日志，且措辞要说明「本地封面未上传」
+        assert source.count("_use_recommended_cover(page)") >= 4
+        assert "本次发布没有指定封面文件" in source
+        assert "封面文件不存在" in source
+        assert "封面弹窗打不开，本地封面未能上传" in source
+        assert "没有找到上传入口，本地封面未能上传" in source
+
+    def test_logs_prepared_cover(self):
+        import inspect
+
+        from app.providers.publisher.douyin import DouyinPublisher
+
+        source = inspect.getsource(DouyinPublisher._set_cover)
+        assert "准备上传本地封面" in source, "开始上传前应记录即将上传的文件，便于对照"
+
+    def test_verifies_preview_changed(self):
+        """上传后应校验封面预览是否变化，而不是盲信 set_input_files 成功。"""
+        import inspect
+
+        from app.providers.publisher.douyin import DouyinPublisher
+
+        assert hasattr(DouyinPublisher, "_cover_preview_src")
+        source = inspect.getsource(DouyinPublisher._set_cover)
+        assert "_cover_preview_src" in source
+
+    def test_generated_cover_is_much_larger_than_a_video_frame(self, tmp_path):
+        """设计封面是矢量风大色块，JPEG 体积显著大于抽帧结果。
+
+        这条用于区分「磁盘上到底是设计稿还是视频帧」——
+        事故中 7 个条目的封面只有 20-153KB，正是旧的抽帧产物。
+        """
+        out = tmp_path / "gen.jpg"
+        generate_cover(video=None, title="体积判据", tags=["测试", "封面"],
+                       out_path=out, style=CoverStyle(width=1080, height=1920))
+        assert out.stat().st_size > 150 * 1024, (
+            f"设计封面只有 {out.stat().st_size // 1024}KB，可能是抽帧产物"
+        )
