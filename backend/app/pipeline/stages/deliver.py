@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 
 from app.pipeline.context import ItemState, StageContext
 from app.providers.base import ProviderError, PublishRequest
+from app.services import cover as cover_mod
+from app.utils import ffmpeg as ffmpeg_utils
 from app.utils.text import truncate
 
 logger = logging.getLogger(__name__)
@@ -48,6 +51,8 @@ async def stage_metadata(ctx: StageContext, state: ItemState) -> None:
         tags=tags,
         stats={**state.item.stats, **state.stats},
     )
+    await _generate_cover(ctx, state, title_zh, tags)
+
     await ctx.reporter.item_stage(
         state.item.id, "metadata", 100, f"标题：{title_zh}", overall=ctx.overall_for("metadata", 100)
     )
@@ -72,17 +77,19 @@ def resolve_schedule(options: dict, publish_config: dict) -> str | None:
 
 async def stage_publish(ctx: StageContext, state: ItemState) -> None:
     publish_cfg = ctx.config.merged("publish")
-    auto_publish = bool(publish_cfg.get("auto_publish", True))
+    # 默认手动发布：未显式开启时只产出成片，条目停在「待发布」等人工确认
+    auto_publish = bool(publish_cfg.get("auto_publish", False))
     if ctx.config.options.get("auto_publish") is not None:
         auto_publish = bool(ctx.config.options["auto_publish"])
 
     if not auto_publish:
-        await ctx.reporter.item_update(state.item.id, publish_status="skipped", message="已跳过发布")
+        await ctx.reporter.item_update(state.item.id, publish_status="pending", message="待手动发布")
         await ctx.reporter.item_stage(
-            state.item.id, "publish", 100, "已跳过自动发布", overall=ctx.overall_for("publish", 100)
+            state.item.id, "publish", 100, "待手动发布", overall=ctx.overall_for("publish", 100)
         )
         await ctx.reporter.log(
-            "任务设置为不自动发布，成片已产出，可在任务详情页手动发布",
+            "成片与文案已产出，等待人工确认发布：在任务详情页点「立即发布」即可上传抖音。"
+            "如需全过程自动发布，请到「系统配置 → 发布」打开「自动发布」。",
             stage="publish",
             item_id=state.item.id,
         )
@@ -134,5 +141,70 @@ async def stage_publish(ctx: StageContext, state: ItemState) -> None:
     await ctx.reporter.log(
         f"发布完成：{result.message}" + (f"｜链接 {result.work_url}" if result.work_url else ""),
         stage="publish",
+        item_id=state.item.id,
+    )
+
+async def _generate_cover(ctx: StageContext, state: ItemState, title: str, tags: list[str]) -> None:
+    """生成发布用封面。
+
+    放在 metadata 阶段而不是 align 阶段：中文标题与话题标签是在这里才产出的，
+    而封面需要把它们排上去（早于此阶段只有原始英文标题）。
+    """
+    video_cfg = ctx.config.merged("video")
+    mode = str(video_cfg.get("cover_mode", "generated"))
+
+    # 底图用成片（已烧好字幕），抽帧位置取偏前的位置，通常画面更稳
+    source = state.paths.output if state.paths.output.exists() else state.paths.video
+    if not source.exists():
+        return
+
+    if mode != "generated":
+        # 退化为直接抽一帧
+        try:
+            await ffmpeg_utils.extract_cover(source, state.paths.cover, at=1.0)
+            await ctx.reporter.item_update(state.item.id, cover_path=ctx.relative(state.paths.cover))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("封面抽取失败：%s", exc)
+        return
+
+    media = await ffmpeg_utils.probe(source)
+    width, height = cover_mod.cover_size_for(
+        str(video_cfg.get("target_aspect", "original")), media.width, media.height
+    )
+    style = cover_mod.CoverStyle(
+        width=width,
+        height=height,
+        theme=str(video_cfg.get("cover_theme", "tech_blue")),
+        brand=str(video_cfg.get("cover_brand", "") or ""),
+        max_tags=int(video_cfg.get("cover_max_tags", 4)),
+    )
+    try:
+        await asyncio.to_thread(
+            cover_mod.generate_cover,
+            video=source,
+            title=state.item.title_zh or title,
+            tags=list(state.item.tags or tags),
+            out_path=state.paths.cover,
+            style=style,
+            frame_at=min(1.0, max(0.1, media.duration / 10)),
+            work_dir=state.paths.work_dir / "cover",
+        )
+    except Exception as exc:  # noqa: BLE001 - 封面失败不应影响发布主流程
+        await ctx.reporter.log(
+            f"封面生成失败，将退回抽帧：{exc}", level="warning", stage="metadata", item_id=state.item.id
+        )
+        try:
+            await ffmpeg_utils.extract_cover(source, state.paths.cover, at=1.0)
+        except Exception:  # noqa: BLE001
+            return
+
+    state.stats["cover"] = {"mode": mode, "size": f"{width}x{height}",
+                            "theme": video_cfg.get("cover_theme", "tech_blue")}
+    await ctx.reporter.item_update(
+        state.item.id, cover_path=ctx.relative(state.paths.cover), stats={**state.item.stats, **state.stats}
+    )
+    await ctx.reporter.log(
+        f"已生成封面：{width}x{height}，含标题与 {len(state.item.tags or tags)} 个标签",
+        stage="metadata",
         item_id=state.item.id,
     )

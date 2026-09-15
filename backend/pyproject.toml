@@ -21,6 +21,8 @@ dependencies = [
     #  - yt-dlp-ejs 提供 JS 挑战求解器组件，缺失时会告警并可能拿不到全部清晰度
     "curl-cffi>=0.7.0",
     "yt-dlp-ejs>=0.3.0",
+    # 封面生成（绘制标题/标签/渐变）
+    "Pillow>=10.0.0",
     "websockets>=12.0",
 ]
 

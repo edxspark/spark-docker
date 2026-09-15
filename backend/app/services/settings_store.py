@@ -155,6 +155,14 @@ class VideoConfig(BaseModel):
     subtitle_margin_v: int = Field(default=40, ge=0, le=600)
     subtitle_alignment: Literal["bottom", "middle", "top"] = "bottom"
     subtitle_outline: int = Field(default=1, ge=0, le=6)
+    # 封面来源：
+    #   generated —— 用视频帧做底图，叠加深色渐变并排版标题与标签（推荐）
+    #   frame     —— 直接抽一帧，不做任何设计
+    cover_mode: Literal["generated", "frame"] = "generated"
+    cover_theme: Literal["tech_blue", "tech_dark", "minimal"] = "tech_blue"
+    # 封面左上角的品牌标识，留空则不显示
+    cover_brand: str = "AI 译制"
+    cover_max_tags: int = Field(default=4, ge=0, le=8)
     # 原视频音轨的处理方式：
     #   remove —— 完全丢弃原音轨（人声与背景音乐都不要），成片只有配音
     #   keep   —— 保留原音轨并压低音量，与配音混合
