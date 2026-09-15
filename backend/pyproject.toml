@@ -25,7 +25,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-publish = ["playwright>=1.45.0"]
+# patchright 是 Playwright 的 stealth 分支，去掉 CDP 检测特征；
+# 参考实现 social-auto-upload 用的正是它，抖音对原生 Playwright 的指纹更敏感
+publish = ["patchright>=1.49.0", "playwright>=1.45.0"]
 dub = ["demucs>=4.0.1"]
 dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "ruff>=0.5.0"]
 

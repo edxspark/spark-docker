@@ -166,3 +166,54 @@ class TestDryRunSupport:
         finally:
             video.unlink(missing_ok=True)
         assert clicked == [], "干跑路径不应触碰发布点击"
+
+
+class TestClickReachability:
+    """事故：发布按钮位于首屏之外，force click 在视口外点击 → 静默落空。"""
+
+    def test_launch_uses_chromium_channel(self):
+        """默认构建是 Chromium for Testing，带已知自动化标记；应使用真实 Chromium 通道。"""
+        from app.providers.publisher.douyin import _launch_options
+
+        opts = _launch_options(headless=True)
+        assert opts["channel"] == "chromium"
+        assert opts["headless"] is True
+        assert any("AutomationControlled" in a for a in opts["args"])
+
+    def test_launch_falls_back_without_channel(self):
+        from app.providers.publisher.douyin import _launch_options
+
+        assert "channel" not in _launch_options(headless=True, channel=None)
+
+    async def test_playwright_prefers_patchright(self):
+        import importlib.util
+
+        from app.providers.publisher.douyin import _require_playwright
+
+        api = _require_playwright()
+        if importlib.util.find_spec("patchright") is not None:
+            assert api.__module__.startswith("patchright"), (
+                "已安装 patchright 时应优先使用它（stealth 驱动）"
+            )
+
+    async def test_can_click_at_detects_offscreen_element(self):
+        """元素存在但其中心点在视口外时，必须判定为不可点击。"""
+        from app.providers.publisher.douyin import _can_click_at
+
+        class OffscreenLocator:
+            async def bounding_box(self):
+                return {"x": 100, "y": 5000, "width": 120, "height": 32}
+
+            async def evaluate(self, _script):
+                return False  # 模拟 elementFromPoint 返回 null
+
+        assert await _can_click_at(None, OffscreenLocator()) is False
+
+    async def test_can_click_at_handles_missing_box(self):
+        from app.providers.publisher.douyin import _can_click_at
+
+        class NoBox:
+            async def bounding_box(self):
+                return None
+
+        assert await _can_click_at(None, NoBox()) is False

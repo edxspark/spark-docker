@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -116,13 +117,123 @@ if (originalQuery) {
 
 
 def _require_playwright():
+    """返回浏览器驱动入口。
+
+    优先 patchright：它是 Playwright 的 stealth 分支，去掉了 CDP 检测特征。
+    参考实现（social-auto-upload）用的正是它，抖音对原生 Playwright 的自动化
+    指纹更敏感，表现为「页面正常打开但关键按钮点了没反应」这类静默失败。
+    未安装时退回 playwright。
+    """
+    try:
+        from patchright.async_api import async_playwright  # noqa: PLC0415
+
+        logger.debug("使用 patchright（stealth 驱动）")
+        return async_playwright
+    except ImportError:
+        pass
     try:
         from playwright.async_api import async_playwright  # noqa: PLC0415
+
+        logger.info("未安装 patchright，回退到 playwright；建议 `uv pip install patchright` 以降低被识别风险")
+        return async_playwright
     except ImportError as exc:  # pragma: no cover
         raise ProviderError(
-            "未安装 playwright：请执行 `pip install playwright && playwright install chromium`"
+            "未安装浏览器驱动：请执行 `uv pip install patchright` 并 `patchright install chromium`"
         ) from exc
-    return async_playwright
+
+
+async def _dismiss_overlays(page) -> None:
+    """关掉可能挡住点击的浮层。
+
+    发布页会残留 semi-portal 之类的浮层（公告、提示、上一步打开的对话框）。
+    它们不一定可见，但会拦截指针事件，让 Playwright 的可操作性检查失败。
+    """
+    with contextlib.suppress(Exception):
+        await page.keyboard.press("Escape")
+    for selector in (
+        ".semi-modal-close",
+        ".semi-sidesheet-close",
+        'button[aria-label="关闭"]',
+        'button[aria-label="Close"]',
+    ):
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() and await locator.is_visible():
+                await locator.click(timeout=2000)
+                await page.wait_for_timeout(300)
+        except Exception:  # noqa: BLE001 - 关不掉也不该中断流程
+            continue
+
+
+async def _can_click_at(page, locator) -> bool:
+    """判断元素中心点是否真的接收点击（elementFromPoint 命中的是它自身或后代）。
+
+    这一步很关键：元素存在、甚至 is_enabled() 为真，都不代表点得到——
+    它可能在视口之外（实测发布按钮 y=1292 而视口高 900），或被浮层遮住。
+    此时点击会静默落空，表现为「点了发布但页面没反应」。
+    """
+    try:
+        box = await locator.bounding_box()
+        if not box or box["width"] <= 0 or box["height"] <= 0:
+            return False
+        return bool(
+            await locator.evaluate(
+                """el => {
+                    const r = el.getBoundingClientRect();
+                    const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+                    if (cy < 0 || cy > window.innerHeight || cx < 0 || cx > window.innerWidth) return false;
+                    const top = document.elementFromPoint(cx, cy);
+                    return !!(top && (el === top || el.contains(top)));
+                }"""
+            )
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _native_click(page, locator) -> bool:
+    """用真实鼠标事件点击，并补发完整的 pointer/mouse 事件序列。
+
+    抖音部分自定义组件只认这套事件（单纯 click() 会被静默忽略）。
+    点击前必须先把元素滚进视口——否则坐标落在视口外，点击等于没点。
+    """
+    try:
+        await locator.scroll_into_view_if_needed(timeout=5000)
+    except Exception:  # noqa: BLE001
+        pass
+    await page.wait_for_timeout(250)
+
+    if not await _can_click_at(page, locator):
+        return False
+
+    box = await locator.bounding_box()
+    if not box:
+        return False
+    x = box["x"] + box["width"] / 2
+    y = box["y"] + box["height"] / 2
+    try:
+        await page.mouse.move(x, y)
+        await page.wait_for_timeout(120)
+        await page.mouse.click(x, y)
+        await page.wait_for_timeout(150)
+        await page.evaluate(
+            """({x, y}) => {
+                const el = document.elementFromPoint(x, y);
+                if (!el) return;
+                const opts = {bubbles:true,cancelable:true,composed:true,clientX:x,clientY:y,
+                              view:window,pointerId:1,pointerType:'mouse',isPrimary:true,button:0,buttons:1};
+                for (const t of ['pointerover','pointerenter','pointerdown','mousedown',
+                                 'pointerup','mouseup','click']) {
+                    const C = t.startsWith('pointer') ? PointerEvent : MouseEvent;
+                    try { el.dispatchEvent(new C(t, opts)); }
+                    catch (e) { try { el.dispatchEvent(new MouseEvent(t, opts)); } catch (_) {} }
+                }
+            }""",
+            {"x": x, "y": y},
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 async def _first_visible(page, selectors: tuple[str, ...], *, timeout: float = 3000, state: str = "visible"):
@@ -162,9 +273,13 @@ async def _exists(page, selectors: tuple[str, ...]) -> bool:
     return False
 
 
-def _launch_options(headless: bool) -> dict:
-    """chromium.launch 只接受启动级参数；viewport/locale 属于 new_context。"""
-    return {
+def _launch_options(headless: bool, *, channel: str | None = "chromium") -> dict:
+    """chromium.launch 只接受启动级参数；viewport/locale 属于 new_context。
+
+    channel="chromium" 用真实 Chromium 构建，而不是 Playwright 默认下载的
+    "Chromium for Testing"——后者带有已知的自动化标记，容易被平台识别。
+    """
+    options: dict = {
         "headless": headless,
         "args": [
             "--no-sandbox",
@@ -172,10 +287,18 @@ def _launch_options(headless: bool) -> dict:
             "--disable-dev-shm-usage",
         ],
     }
+    if channel:
+        options["channel"] = channel
+    return options
 
 
 async def _new_context(playwright, storage_state: Path | None, headless: bool):
-    browser = await playwright.chromium.launch(**_launch_options(headless))
+    try:
+        browser = await playwright.chromium.launch(**_launch_options(headless))
+    except Exception as exc:  # noqa: BLE001
+        # channel 未安装等情况下退回默认构建，保证流程仍可运行
+        logger.warning("channel=chromium 启动失败（%s），回退到默认 Chromium", str(exc)[:150])
+        browser = await playwright.chromium.launch(**_launch_options(headless, channel=None))
     options: dict = {
         "viewport": {"width": 1440, "height": 900},
         "locale": "zh-CN",
@@ -630,24 +753,44 @@ class DouyinPublisher(BasePublisher):
         await page.wait_for_timeout(1000)
 
     async def _click_publish(self, page, timeout_ms: int) -> None:
+        """点击「发布」并等待跳转到作品管理页。
+
+        必须先把按钮滚进视口并校验其中心点真的接收点击。
+        原实现直接 click(force=True) 作为兜底——force 不滚动也不做可操作性检查，
+        在按钮位于首屏之外时（实测 y=1292、视口高 900）会在视口外点击，
+        表现为「点了发布但页面毫无反应」，最后误报为「未跳转到作品管理页」。
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_ms / 1000
+        last_reason = "未找到发布按钮"
+
         while loop.time() < deadline:
+            await _dismiss_overlays(page)
+
             button = await _first_visible(page, PUBLISH_BUTTON_SELECTORS, timeout=5000)
             if button is not None:
-                try:
-                    await button.click(timeout=5000)
-                except Exception:  # noqa: BLE001
-                    await page.get_by_role("button", name="发布", exact=True).click(force=True)
+                if await _native_click(page, button):
+                    last_reason = "已点击发布按钮，但页面未跳转"
+                else:
+                    # 可达性不足时先修环境再重试，而不是在视口外空点
+                    await button.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(500)
+                    if await _native_click(page, button):
+                        last_reason = "已点击发布按钮，但页面未跳转"
+                    else:
+                        last_reason = "发布按钮存在但无法点击（可能被浮层遮挡或在视口外）"
+
             try:
-                await page.wait_for_url(MANAGE_URL_GLOB, timeout=5000)
+                await page.wait_for_url(MANAGE_URL_GLOB, timeout=6000)
                 return
             except Exception:  # noqa: BLE001
-                # 可能弹出「请设置封面后再发布」等拦截
                 if await _exists(page, ("text=请设置封面后再发布",)):
-                    await self._set_cover(page, PublishRequest(video_path=Path(), title="", cover_path=None))
-                await page.wait_for_timeout(1000)
-        raise ProviderError("点击发布后未跳转到作品管理页，请在抖音后台确认发布状态")
+                    await self._set_cover(
+                        page, PublishRequest(video_path=Path(), title="", cover_path=None)
+                    )
+                await page.wait_for_timeout(1200)
+
+        raise ProviderError(f"点击发布后未跳转到作品管理页（{last_reason}），请在抖音后台确认发布状态")
 
     async def _collect_work_url(self, page) -> str:
         try:
