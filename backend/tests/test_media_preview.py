@@ -156,3 +156,85 @@ class TestMissingArtifacts:
         task_id, _, _ = ready_item
         response = await client.get(f"/api/tasks/{task_id}/items/999999/file")
         assert response.status_code == 404
+
+
+class TestRepublish:
+    """重新发布：对已发布过的条目再上传一次。
+
+    抖音不会用新上传替换旧作品，因此必须显式确认，否则会静默多出一个作品。
+    """
+
+    async def test_published_item_requires_explicit_republish(self, client, ready_item):
+        from sqlalchemy import select
+
+        task_id, item_id, _ = ready_item
+        async with SessionLocal() as session:
+            item = (
+                await session.execute(select(TaskItem).where(TaskItem.id == item_id))
+            ).scalars().first()
+            assert item is not None
+            item.publish_status = "published"
+            item.publish_url = "https://www.douyin.com/video/old"
+            await session.commit()
+
+        # 不带 republish：应当拒绝，避免悄悄多出一个作品
+        response = await client.post(f"/api/tasks/{task_id}/items/{item_id}/publish", json={})
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "已发布过" in detail and "republish" in detail
+
+    async def test_failed_item_can_publish_without_flag(self, client, ready_item):
+        """失败过的条目属于正常重试，不应要求额外确认。"""
+        from sqlalchemy import select
+
+        task_id, item_id, _ = ready_item
+        async with SessionLocal() as session:
+            item = (
+                await session.execute(select(TaskItem).where(TaskItem.id == item_id))
+            ).scalars().first()
+            assert item is not None
+            item.publish_status = "failed"
+            await session.commit()
+
+        # 不带 republish 时应能进入发布流程（mock 发布器会成功）
+        response = await client.post(f"/api/tasks/{task_id}/items/{item_id}/publish", json={})
+        assert response.status_code == 200
+        assert response.json()["publish_status"] == "published"
+
+
+class TestPublishHistory:
+    """每次发布尝试都要留痕：重发是常见操作，需要能回看历次结果。"""
+
+    def test_records_attempt_with_kind_and_result(self):
+        from app.api.tasks import _record_publish_attempt
+        from app.models import TaskItem
+
+        item = TaskItem()
+        _record_publish_attempt(item, kind="publish", success=True, message="首次成功", url="u1")
+        _record_publish_attempt(item, kind="republish", success=False, message="重发失败")
+        history = (item.stats or {})["publish_history"]
+        assert len(history) == 2
+        assert history[0]["kind"] == "publish" and history[0]["success"] is True
+        assert history[1]["kind"] == "republish" and history[1]["success"] is False
+        assert history[1]["url"] == ""
+
+    def test_history_is_capped(self):
+        from app.api.tasks import _PUBLISH_HISTORY_LIMIT, _record_publish_attempt
+        from app.models import TaskItem
+
+        item = TaskItem()
+        for i in range(_PUBLISH_HISTORY_LIMIT + 5):
+            _record_publish_attempt(item, kind="publish", success=True, message=f"第{i}次")
+        history = (item.stats or {})["publish_history"]
+        assert len(history) == _PUBLISH_HISTORY_LIMIT, "历史应被截断，避免 stats 无限膨胀"
+        # 保留的是最近的若干次
+        assert history[-1]["message"] == f"第{_PUBLISH_HISTORY_LIMIT + 4}次"
+
+    def test_history_survives_missing_stats(self):
+        from app.api.tasks import _record_publish_attempt
+        from app.models import TaskItem
+
+        item = TaskItem()
+        item.stats = None
+        _record_publish_attempt(item, kind="publish", success=True, message="x")
+        assert len((item.stats or {})["publish_history"]) == 1

@@ -448,6 +448,33 @@ async def delete_task(
     return MessageOut(message="任务已删除" + ("（含文件）" if remove_files else ""))
 
 
+# 发布历史上限：只保留最近若干次，避免 stats 无限膨胀
+_PUBLISH_HISTORY_LIMIT = 10
+
+
+def _record_publish_attempt(
+    item: TaskItem, *, kind: str, success: bool, message: str, url: str = ""
+) -> None:
+    """把每次发布尝试追加进 stats.publish_history。
+
+    重新发布是常见操作（首次失败后重试、删掉旧作品后再传），
+    需要能回看每一次的结果，而不是只留最后一次的状态。
+    """
+    stats = dict(item.stats or {})
+    history = list(stats.get("publish_history") or [])
+    history.append(
+        {
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "kind": kind,
+            "success": success,
+            "message": str(message or "")[:300],
+            "url": url or "",
+        }
+    )
+    stats["publish_history"] = history[-_PUBLISH_HISTORY_LIMIT:]
+    item.stats = stats
+
+
 @router.post("/{task_id}/items/{item_id}/publish", response_model=TaskItemOut)
 async def publish_item(
     task_id: int,
@@ -472,6 +499,16 @@ async def publish_item(
 
     immediate = True if payload is None else payload.immediate
     dry_run = bool(payload.dry_run) if payload is not None else False
+    republish = bool(payload.republish) if payload is not None else False
+
+    # 已发布过的条目必须显式确认「重新发布」：
+    # 抖音不会用新上传替换旧作品，直接重传会多出一个作品。
+    if item.publish_status == "published" and not republish and not dry_run:
+        raise HTTPException(
+            status_code=409,
+            detail="该条目已发布过。重新发布会再上传一个新作品（旧作品不会自动删除），"
+                   "确认请带 republish=true。",
+        )
 
     config = await settings_store.load_all(session)
     publisher = build_publisher(PublishConfig(**config["publish"]), settings.auth_dir / "douyin_default.json")
@@ -502,20 +539,29 @@ async def publish_item(
     except Exception as exc:  # noqa: BLE001
         item.publish_status = "failed"
         item.publish_error = str(exc)
+        _record_publish_attempt(item, kind="republish" if republish else "publish", success=False, message=str(exc))
         await session.commit()
         raise HTTPException(status_code=502, detail=f"发布失败：{exc}") from exc
 
     if dry_run:
         # 干跑只是自检：不写入「已发布」，也不记录作品链接
         item.message = f"[干跑] {result.message}"[:400]
+        _record_publish_attempt(item, kind="dry_run", success=True, message=result.message)
         await session.commit()
         await session.refresh(item)
         return TaskItemOut.model_validate(item)
 
     item.publish_status = "published" if result.success else "failed"
-    item.publish_url = result.work_url
+    item.publish_url = result.work_url or item.publish_url
     item.publish_error = ""
     item.published_at = datetime.now() if result.success else None
+    _record_publish_attempt(
+        item,
+        kind="republish" if republish else "publish",
+        success=bool(result.success),
+        message=result.message,
+        url=result.work_url,
+    )
     await session.commit()
     await session.refresh(item)
     await event_bus.emit(task_id, "item.updated", id=item.id, task_id=task_id, publish_status=item.publish_status)

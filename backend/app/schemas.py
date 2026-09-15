@@ -203,3 +203,6 @@ class PublishItemRequest(BaseModel):
     # 干跑：完整上传并填好表单，但停在「发布」按钮前，不真正发出作品。
     # 用于发布前自检，避免第一次失败发生在视频已上传之后。
     dry_run: bool = False
+    # 重新发布：对「已发布过」的条目再上传一次。
+    # 必须显式传 true——抖音不会因为重传而替换旧作品，否则会静默多出一个作品。
+    republish: bool = False
