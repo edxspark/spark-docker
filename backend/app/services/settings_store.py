@@ -101,7 +101,11 @@ class PublishConfig(BaseModel):
     """抖音发布配置。"""
 
     provider: Literal["douyin", "mock"] = "mock"
-    headless: bool = False
+    # 默认无头：发布在后台静默完成，不弹出浏览器窗口。
+    # 首次扫码登录仍需可见窗口（登录流程本身始终是有头的），之后发布可以全程无头。
+    headless: bool = True
+    # 无头发布遇到验证码/身份验证时，是否自动改为有头重试一次让人工接手
+    headless_fallback_to_visible: bool = True
     # 是否在流水线末尾自动发布。默认关闭：流水线只产出成片与文案，
     # 条目停在「待发布」，由人在任务详情页确认后手动发布；
     # 想全自动发布，需要在「系统配置 → 发布」里显式打开。

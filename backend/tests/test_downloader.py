@@ -448,3 +448,104 @@ class TestThreadsafeProgress:
             return seen
 
         assert asyncio.run(main()) == ["a", "b"]
+
+
+class TestHeadlessPublishFallback:
+    """无头发布遇到人工校验时，应自动降级为有头重试，而不是直接失败。
+
+    背景：用户要求「不打开浏览器」。无头可行（实测用其登录态能正常打开上传页），
+    但无头更容易触发验证码/身份验证——那类校验必须有人工可见窗口。
+    """
+
+    def test_needs_human_detects_verification(self):
+        from app.providers.publisher.douyin import _needs_human
+
+        for message in (
+            "抖音要求完成身份验证（短信或滑块），无头模式无法自动通过",
+            "请完成安全验证",
+            "请输入验证码",
+        ):
+            assert _needs_human(RuntimeError(message)) is True, message
+
+    def test_needs_human_ignores_ordinary_failures(self):
+        from app.providers.publisher.douyin import _needs_human
+
+        for message in (
+            "抖音登录态已失效，请先在「抖音账号」页重新扫码登录",
+            "等待视频上传完成超时（600s）",
+            "未找到上传入口，抖音创作者中心页面结构可能已改版",
+        ):
+            assert _needs_human(RuntimeError(message)) is False, message
+
+    def test_headless_is_the_default(self):
+        from app.services.settings_store import PublishConfig
+
+        config = PublishConfig()
+        assert config.headless is True, "默认应无头，避免弹出浏览器窗口"
+        assert config.headless_fallback_to_visible is True
+
+    async def test_falls_back_to_visible_on_verification(self, monkeypatch):
+        from app.providers.base import ProviderError, PublishRequest
+        from app.providers.publisher.douyin import DouyinPublisher
+        from app.services.settings_store import PublishConfig
+
+        publisher = DouyinPublisher(PublishConfig(provider="douyin", headless=True), Path("/tmp/x.json"))
+        modes: list[bool] = []
+
+        async def fake_locked(request, video_path, *, headless):
+            modes.append(headless)
+            if headless:
+                raise ProviderError("抖音要求完成身份验证（短信或滑块），无头模式无法自动通过")
+            return "ok"
+
+        monkeypatch.setattr(publisher, "_publish_locked", fake_locked)
+        video = Path("/tmp/fake.mp4")
+        video.write_bytes(b"x")
+        request = PublishRequest(video_path=video, title="标题")
+        result = await publisher.publish(request)
+        assert result == "ok"
+        assert modes == [True, False], f"应先无头再降级为有头，实际 {modes}"
+        video.unlink(missing_ok=True)
+
+    async def test_no_fallback_when_disabled(self, monkeypatch):
+        from app.providers.base import ProviderError, PublishRequest
+        from app.providers.publisher.douyin import DouyinPublisher
+        from app.services.settings_store import PublishConfig
+
+        publisher = DouyinPublisher(
+            PublishConfig(provider="douyin", headless=True, headless_fallback_to_visible=False),
+            Path("/tmp/x.json"),
+        )
+        modes: list[bool] = []
+
+        async def fake_locked(request, video_path, *, headless):
+            modes.append(headless)
+            raise ProviderError("抖音要求完成身份验证")
+
+        monkeypatch.setattr(publisher, "_publish_locked", fake_locked)
+        video = Path("/tmp/fake2.mp4")
+        video.write_bytes(b"x")
+        with pytest.raises(ProviderError):
+            await publisher.publish(PublishRequest(video_path=video, title="标题"))
+        assert modes == [True], "关闭降级后不应再尝试有头"
+        video.unlink(missing_ok=True)
+
+    async def test_ordinary_error_does_not_trigger_fallback(self, monkeypatch):
+        from app.providers.base import ProviderError, PublishRequest
+        from app.providers.publisher.douyin import DouyinPublisher
+        from app.services.settings_store import PublishConfig
+
+        publisher = DouyinPublisher(PublishConfig(provider="douyin", headless=True), Path("/tmp/x.json"))
+        modes: list[bool] = []
+
+        async def fake_locked(request, video_path, *, headless):
+            modes.append(headless)
+            raise ProviderError("等待视频上传完成超时（600s）")
+
+        monkeypatch.setattr(publisher, "_publish_locked", fake_locked)
+        video = Path("/tmp/fake3.mp4")
+        video.write_bytes(b"x")
+        with pytest.raises(ProviderError):
+            await publisher.publish(PublishRequest(video_path=video, title="标题"))
+        assert modes == [True], "普通失败不该再开一次有头浏览器"
+        video.unlink(missing_ok=True)

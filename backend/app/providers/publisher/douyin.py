@@ -75,6 +75,25 @@ UPLOAD_FAILED_SELECTORS = (
     'text=上传失败',
 )
 
+# 需要人工介入的风控/校验：无头模式下无法自动通过，命中后应降级为有头
+VERIFICATION_SELECTORS = (
+    "text=身份验证",
+    "text=请完成安全验证",
+    "text=获取验证码",
+    "text=短信验证",
+    "div.uc-ui-verify_sms-verify_button",
+    "text=拖动滑块",
+    "text=验证码",
+)
+
+_HUMAN_MARKERS = ("身份验证", "安全验证", "验证码", "滑块", "验证")
+
+
+def _needs_human(exc: Exception) -> bool:
+    """判断该失败是否属于「必须人工过校验」，用于决定是否降级为有头模式。"""
+    message = str(exc)
+    return any(marker in message for marker in _HUMAN_MARKERS)
+
 # 反自动化检测：抹掉最常见的可检测特征
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -295,11 +314,25 @@ class DouyinPublisher(BasePublisher):
             raise ProviderError("发布标题不能为空")
 
         async with self._lock:
-            return await self._publish_locked(request, video_path)
+            headless = request.headless or self.config.headless
+            if not headless:
+                return await self._publish_locked(request, video_path, headless=False)
 
-    async def _publish_locked(self, request: PublishRequest, video_path: Path) -> PublishResult:
+            # 无头优先：后台静默完成，不弹出浏览器窗口。
+            # 但无头更容易触发平台的身份验证/验证码——这类校验必须有可见窗口才能人工过。
+            # 因此命中风控时自动降级为「有头」重试一次，让用户接手，而不是直接失败。
+            try:
+                return await self._publish_locked(request, video_path, headless=True)
+            except ProviderError as exc:
+                if not self.config.headless_fallback_to_visible or not _needs_human(exc):
+                    raise
+                logger.warning("无头发布遇到人工校验，改为有头模式重试：%s", str(exc)[:200])
+                return await self._publish_locked(request, video_path, headless=False)
+
+    async def _publish_locked(
+        self, request: PublishRequest, video_path: Path, *, headless: bool
+    ) -> PublishResult:
         async_playwright = _require_playwright()
-        headless = request.headless or self.config.headless
         timeout_ms = self.config.timeout * 1000
 
         async with async_playwright() as playwright:
@@ -312,6 +345,12 @@ class DouyinPublisher(BasePublisher):
                 await page.wait_for_timeout(2000)
                 if await _exists(page, ('text=扫码登录', 'text=手机号登录')):
                     raise ProviderError("抖音登录态已失效，请先在「抖音账号」页重新扫码登录")
+                # 风控校验（短信验证 / 身份验证 / 滑块）：无头下无法通过，需要人工介入
+                if await _exists(page, VERIFICATION_SELECTORS):
+                    raise ProviderError(
+                        "抖音要求完成身份验证（短信或滑块），无头模式无法自动通过。"
+                        "请保持「无头模式」关闭后重试，在弹窗中人工完成验证"
+                    )
 
                 # 1) 选择文件并等待跳转到发布页
                 upload_input = await _first_visible(page, UPLOAD_INPUT_SELECTORS, timeout=60000)
