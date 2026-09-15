@@ -95,11 +95,14 @@ def make_fixture_srt(dest: Path) -> Path:
 
 
 class DemoDownloader:
-    """把本地夹具当作「已从 YouTube 下载」的结果。"""
+    """把本地夹具当作「已从 YouTube 下载」的结果。
+
+    subtitle=None 时模拟「视频没有任何字幕」的情形，用于验证语音识别兜底链路。
+    """
 
     name = "demo"
 
-    def __init__(self, video: Path, subtitle: Path) -> None:
+    def __init__(self, video: Path, subtitle: Path | None) -> None:
         self.video = video
         self.subtitle = subtitle
 
@@ -133,20 +136,23 @@ class DemoDownloader:
             subtitle_path=self.subtitle,
             thumbnail_path=None,
             info=item,
-            subtitle_kind="manual",
+            subtitle_kind="manual" if self.subtitle else "none",
         )
 
     async def fetch_thumbnail(self, item: VideoInfo, out_path: Path):
         return None
 
 
-async def run(out_dir: Path, aspect: str, keep_mock_media: bool) -> int:
+async def run(out_dir: Path, aspect: str, no_subtitle: bool, asr_provider: str) -> int:
     ensure_tools()
     settings.ensure_dirs()
 
     fixtures = out_dir / "fixtures"
     video = make_fixture_video(fixtures / "demo.mp4", 12.8)
-    subtitle = make_fixture_srt(fixtures / "demo.en.srt")
+    subtitle: Path | None = make_fixture_srt(fixtures / "demo.en.srt")
+    if no_subtitle:
+        subtitle = None
+        print("→ 场景：模拟「视频没有任何字幕」，将走语音识别兜底")
 
     await init_db()
     async with SessionLocal() as session:
@@ -156,6 +162,7 @@ async def run(out_dir: Path, aspect: str, keep_mock_media: bool) -> int:
                 "translator": {"provider": "mock"},
                 "tts": {"provider": "mock", "voice": "xiaoxian", "sample_rate": 24000, "concurrency": 3},
                 "publish": {"provider": "mock", "auto_publish": True, "default_tags": ["演示", "搬运"]},
+                "asr": {"provider": asr_provider, "enabled": True, "max_chunk_seconds": 10},
                 "video": {
                     "target_aspect": aspect,
                     "burn_subtitles": True,
@@ -233,8 +240,19 @@ async def run(out_dir: Path, aspect: str, keep_mock_media: bool) -> int:
     translate = stats.get("translate") or {}
     tts = stats.get("tts") or {}
     output = stats.get("output") or {}
-    print(f"字幕来源：{stats.get('subtitle_source', {}).get('kind', '-')}"
-          f"（{stats.get('subtitle_source', {}).get('cues', 0)} 条原始字幕）")
+    source = stats.get("subtitle_source", {})
+    kind_label = {"manual": "人工字幕", "auto": "自动字幕", "asr": "语音识别（无字幕兜底）"}.get(
+        source.get("kind", ""), "-"
+    )
+    print(f"字幕来源：{kind_label}（{source.get('cues', 0)} 条原始字幕）")
+    if stats.get("asr"):
+        asr = stats["asr"]
+        print(f"语音识别：{asr.get('provider')}，{asr.get('segments', 0)} 句，"
+              f"{asr.get('characters', 0)} 字符，耗时 {asr.get('elapsed_seconds', 0)} 秒")
+    if stats.get("asr_error"):
+        print(f"语音识别失败：{stats['asr_error'][:160]}")
+    if stats.get("no_subtitle"):
+        print("注意：无字幕且语音识别未产出内容，成片保留原声")
     print(f"断句结果：{stats.get('sentences', 0)} 句")
     print(f"翻译：{translate.get('sentences', 0)} 句，{translate.get('tokens', 0)} tokens")
     print(f"配音：{tts.get('segments', 0)} 段，{tts.get('characters', 0)} 字符，音色 {tts.get('voice', '-')}")
@@ -257,8 +275,9 @@ async def run(out_dir: Path, aspect: str, keep_mock_media: bool) -> int:
 
     ok = task.status == TaskStatus.SUCCEEDED.value and item.publish_status == "published"
     print("\n结果：" + ("✓ 流水线端到端跑通（Mock 模式）" if ok else "✗ 流水线未跑通"))
-    if not keep_mock_media:
-        print("提示：Mock 语音合成产出的是静音音轨，仅用于验证对轴逻辑；配置阿里云密钥后会替换为真实配音。")
+    print("提示：Mock 语音合成产出的是静音音轨，仅用于验证对轴逻辑；配置阿里云密钥后会替换为真实配音。")
+    if no_subtitle and asr_provider == "mock":
+        print("      当前为 Mock 语音识别，产出的是占位英文句子，用于验证兜底链路本身。")
     return 0 if ok else 1
 
 
@@ -266,11 +285,23 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="离线验证搬运流水线")
     parser.add_argument("--out", type=Path, default=OUT_ROOT, help="输出目录（默认临时目录）")
     parser.add_argument("--aspect", default="9:16", choices=["original", "9:16", "16:9"], help="输出画面比例")
-    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--no-subtitle",
+        action="store_true",
+        help="模拟视频没有任何字幕，验证「语音识别 → 翻译 → 配音 → 替换音轨」兜底链路",
+    )
+    parser.add_argument(
+        "--asr-provider",
+        default="mock",
+        choices=["mock", "aliyun"],
+        help="语音识别提供者。mock 为离线占位；aliyun 需要阿里云凭证（会产生费用）",
+    )
     args = parser.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
-    return asyncio.run(run(args.out.resolve(), args.aspect, args.quiet))
+    return asyncio.run(
+        run(args.out.resolve(), args.aspect, args.no_subtitle, args.asr_provider)
+    )
 
 
 if __name__ == "__main__":

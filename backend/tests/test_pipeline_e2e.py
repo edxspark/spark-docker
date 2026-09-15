@@ -27,7 +27,7 @@ class StubDownloader:
 
     name = "stub"
 
-    def __init__(self, video: Path, subtitle: Path) -> None:
+    def __init__(self, video: Path, subtitle: Path | None = None) -> None:
         self.video = video
         self.subtitle = subtitle
         self.download_calls = 0
@@ -63,7 +63,7 @@ class StubDownloader:
             subtitle_path=self.subtitle,
             thumbnail_path=None,
             info=item,
-            subtitle_kind="manual",
+            subtitle_kind="manual" if self.subtitle else "none",
         )
 
     async def fetch_thumbnail(self, item: VideoInfo, out_path: Path):
@@ -82,6 +82,7 @@ async def prepared(tmp_root, sample_video, sample_srt, monkeypatch):
                 "translator": {"provider": "mock", "api_key": ""},
                 "tts": {"provider": "mock", "voice": "xiaoxian", "sample_rate": 24000, "concurrency": 2},
                 "publish": {"provider": "mock", "auto_publish": True, "default_tags": ["测试", "搬运"]},
+                "asr": {"provider": "mock", "enabled": True, "max_chunk_seconds": 10},
                 "video": {
                     "target_aspect": "original",
                     "burn_subtitles": True,
@@ -346,3 +347,176 @@ async def _ffmpeg_ok() -> bool:
 
 def item_errors(items: list[TaskItem]) -> str:
     return "\n".join(f"  - {item.title}: {item.error}" for item in items if item.error)
+
+
+async def test_asr_fallback_produces_dubbing_when_no_subtitle(prepared, sample_video):
+    """核心场景：视频没有字幕时，用语音识别生成原文，再翻译配音并替换音轨。
+
+    这正是用户反馈的问题：原先无字幕视频会直接跳过翻译与配音，成片只有原声。
+    """
+    if not (await _ffmpeg_ok()):
+        pytest.skip("未安装 ffmpeg")
+
+    # 把下载器换成「没有字幕」的版本
+    import app.pipeline.runner as runner_module
+
+    prefixed = runner_module.build_all
+
+    def fake_build_all(config, account_file):
+        providers = prefixed(config, account_file)
+        providers["downloader"] = StubDownloader(sample_video, subtitle=None)
+        return providers
+
+    import pytest as _pytest
+
+    mp = _pytest.MonkeyPatch()
+    mp.setattr(runner_module, "build_all", fake_build_all)
+    try:
+        task_id = await _create_task("https://www.youtube.com/watch?v=asr0001")
+        await _run_to_completion(task_id)
+    finally:
+        mp.undo()
+
+    task, items, logs = await _load(task_id)
+    item = items[0]
+    assert task.status == TaskStatus.SUCCEEDED.value, f"任务失败：{task.message}\n{item_errors(items)}"
+
+    stats = item.stats or {}
+    # 原文来自语音识别，而不是下载的字幕
+    assert stats.get("subtitle_source", {}).get("kind") == "asr", stats.get("subtitle_source")
+    assert stats.get("asr", {}).get("segments", 0) > 0
+    assert not stats.get("no_subtitle"), "不应再落到「无字幕保留原声」分支"
+
+    # 有中文字幕、有配音音轨、成片替换了音轨
+    assert item.subtitle_source_path and (settings.data_dir / item.subtitle_source_path).exists()
+    assert item.subtitle_zh_path and (settings.data_dir / item.subtitle_zh_path).exists()
+    assert item.dubbed_audio_path and (settings.data_dir / item.dubbed_audio_path).exists()
+    assert item.output_path and (settings.data_dir / item.output_path).exists()
+    assert stats["output"]["dubbed"] is True, "成片没有使用配音音轨"
+    assert stats["tts"]["segments"] == stats["translate"]["sentences"] > 0
+
+    zh_text = (settings.data_dir / item.subtitle_zh_path).read_text(encoding="utf-8")
+    assert zh_text.strip()
+
+    assert any("语音识别" in log.message for log in logs), "缺少语音识别的日志"
+
+
+async def test_asr_disabled_keeps_original_audio(prepared, sample_video):
+    """关闭语音识别时，无字幕视频仍应产出成片（保留原声），不应失败。"""
+    if not (await _ffmpeg_ok()):
+        pytest.skip("未安装 ffmpeg")
+
+    import pytest as _pytest
+
+    import app.pipeline.runner as runner_module
+
+    prefixed = runner_module.build_all
+
+    def fake_build_all(config, account_file):
+        providers = prefixed(config, account_file)
+        providers["downloader"] = StubDownloader(sample_video, subtitle=None)
+        return providers
+
+    mp = _pytest.MonkeyPatch()
+    mp.setattr(runner_module, "build_all", fake_build_all)
+    try:
+        async with SessionLocal() as session:
+            await settings_store.update(session, {"asr": {"enabled": False}})
+        task_id = await _create_task("https://www.youtube.com/watch?v=asr0002")
+        await _run_to_completion(task_id)
+    finally:
+        mp.undo()
+        async with SessionLocal() as session:
+            await settings_store.update(session, {"asr": {"enabled": True}})
+
+    task, items, _ = await _load(task_id)
+    item = items[0]
+    assert task.status == TaskStatus.SUCCEEDED.value, item_errors(items)
+    assert (item.stats or {}).get("no_subtitle") is True
+    assert item.output_path, "关闭 ASR 后仍应产出成片"
+    assert not item.publish_error
+
+
+async def test_interrupted_asr_is_retried_not_skipped(prepared, sample_video):
+    """回归：语音识别被中断后，重试必须重新识别，而不是因为「试过」就跳过。
+
+    实际发生过：服务重载打断识别，重试却因标记「已尝试」而跳过，
+    结果任务显示成功但成片永远没有中文配音。
+    """
+    if not (await _ffmpeg_ok()):
+        pytest.skip("未安装 ffmpeg")
+
+    from sqlalchemy import select
+
+    task_id = await _create_task("https://www.youtube.com/watch?v=asr0003")
+    async with SessionLocal() as session:
+        item = (
+            await session.execute(select(TaskItem).where(TaskItem.task_id == task_id))
+        ).scalars().first()
+        assert item is not None
+        # 模拟「识别进行到一半被中断」的现场
+        item.stats = {"no_subtitle": True}
+        await session.commit()
+
+    # 换成无字幕下载器，让流程必须走 ASR
+    import pytest as _pytest
+
+    import app.pipeline.runner as runner_module
+
+    prefixed = runner_module.build_all
+
+    def fake_build_all(config, account_file):
+        providers = prefixed(config, account_file)
+        providers["downloader"] = StubDownloader(sample_video, subtitle=None)
+        return providers
+
+    mp = _pytest.MonkeyPatch()
+    mp.setattr(runner_module, "build_all", fake_build_all)
+    try:
+        await _run_to_completion(task_id)
+    finally:
+        mp.undo()
+
+    task, items, _ = await _load(task_id)
+    item = items[0]
+    assert (item.stats or {}).get("subtitle_source", {}).get("kind") == "asr", (
+        "中断后重试跳过了语音识别，成片将没有中文配音"
+    )
+    assert item.dubbed_audio_path, "没有生成配音音轨"
+    assert item.dubbed_audio_path and (settings.data_dir / item.dubbed_audio_path).exists()
+
+
+async def test_definitive_asr_failure_is_not_retried(prepared, sample_video, monkeypatch):
+    """确定性失败（如识别服务不可用）应被标记，避免每次重试都白跑一遍昂贵识别。"""
+    if not (await _ffmpeg_ok()):
+        pytest.skip("未安装 ffmpeg")
+
+    import app.pipeline.runner as runner_module
+
+    prefixed = runner_module.build_all
+
+    def broken_factory_holder(config, account_file):
+        providers = prefixed(config, account_file)
+        providers["downloader"] = StubDownloader(sample_video, subtitle=None)
+
+        def broken_factory():
+            from app.providers.base import NotConfiguredError
+
+            raise NotConfiguredError("模拟：未配置语音识别凭证")
+
+        providers["asr_factory"] = broken_factory
+        return providers
+
+    monkeypatch.setattr(runner_module, "build_all", broken_factory_holder)
+    task_id = await _create_task("https://www.youtube.com/watch?v=asr0004")
+    await _run_to_completion(task_id)
+
+    task, items, logs = await _load(task_id)
+    item = items[0]
+    # 任务本身仍应成功（保留原声产出成片），只是没有配音
+    assert task.status == TaskStatus.SUCCEEDED.value, item_errors(items)
+    stats = item.stats or {}
+    assert stats.get("asr_done") is True, "确定性失败应被标记，避免重复识别"
+    assert "未配置语音识别凭证" in (stats.get("asr_error") or "")
+    assert item.output_path
+    assert any("语音识别不可用" in log.message for log in logs)

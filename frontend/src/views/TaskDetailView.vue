@@ -87,12 +87,25 @@ function statsRows(item: TaskItem): { label: string; value: string }[] {
   const rows: { label: string; value: string }[] = []
   const subtitle = stats.subtitle_source
   if (subtitle) {
+    const kindLabel =
+      subtitle.kind === 'manual'
+        ? '人工字幕'
+        : subtitle.kind === 'auto'
+          ? '自动字幕'
+          : subtitle.kind === 'asr'
+            ? '语音识别（无字幕兜底）'
+            : '未知'
+    rows.push({ label: '原字幕', value: `${kindLabel}，${subtitle.cues ?? 0} 条` })
+  }
+  const asr = stats.asr
+  if (asr) {
     rows.push({
-      label: '原字幕',
-      value: `${subtitle.kind === 'manual' ? '人工字幕' : subtitle.kind === 'auto' ? '自动字幕' : '未知'}` +
-        `，${subtitle.cues ?? 0} 条`,
+      label: '语音识别',
+      value: `${asr.provider === 'mock' ? 'Mock' : '阿里云'}，${asr.segments ?? 0} 句，` +
+        `${formatNumber(asr.characters)} 字符，耗时 ${Math.round(asr.elapsed_seconds || 0)} 秒`,
     })
   }
+  if (stats.asr_error) rows.push({ label: '识别失败', value: String(stats.asr_error).slice(0, 120) })
   if (stats.sentences) rows.push({ label: '断句后', value: `${stats.sentences} 句` })
   const translate = stats.translate
   if (translate) {
@@ -123,7 +136,12 @@ function statsRows(item: TaskItem): { label: string; value: string }[] {
     })
   }
   if (stats.resolution) rows.push({ label: '原片分辨率', value: String(stats.resolution) })
-  if (stats.no_subtitle) rows.push({ label: '注意', value: '该视频无可用英文字幕，已保留原声不配音' })
+  if (stats.no_subtitle) {
+    rows.push({
+      label: '注意',
+      value: '该视频没有字幕，语音识别也未能生成内容，成片已保留原声（未配音、未加中文字幕）',
+    })
+  }
   return rows
 }
 

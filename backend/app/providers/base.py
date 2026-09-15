@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from app.services.subtitles import Cue
+
 ProgressCallback = Callable[[float, str], None]
 
 
@@ -167,3 +169,33 @@ class BasePublisher(ABC):
     @abstractmethod
     async def publish(self, request: PublishRequest) -> PublishResult:
         """发布一条作品。"""
+
+
+# --------------------------------------------------------------------------------------
+# 语音识别（无字幕时的兜底）
+# --------------------------------------------------------------------------------------
+
+
+class BaseASR(ABC):
+    """把媒体（视频/音频）里的语音转成带时间轴的字幕。
+
+    用于「视频没有人工/自动字幕」的场景：先识别出原文，再走翻译与配音流程，
+    最终产出带中文字幕与中文配音的成片。
+    """
+
+    name = "base"
+
+    @abstractmethod
+    async def transcribe(
+        self,
+        media: Path,
+        *,
+        on_progress: Callable[[float, str], Any] | None = None,
+        total_duration: float | None = None,
+        cache_dir: Path | None = None,
+    ) -> list[Cue]:
+        """返回带时间轴的识别结果。
+
+        cache_dir：分块识别结果的落盘目录。语音识别又慢又贵，把每块结果缓存下来，
+        任务中断后重试可以直接复用，不必从头再识别一遍。
+        """

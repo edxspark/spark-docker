@@ -131,6 +131,7 @@ class TaskRunner:
             general=general,
             translator=config["translator"],
             tts=config["tts"],
+            asr=config.get("asr", {}),
             download=config["download"],
             publish=config["publish"],
             video=config["video"],
@@ -255,8 +256,14 @@ class TaskRunner:
             return paths.video.exists() and (bool(state.cues_en) or bool(state.stats.get("no_subtitle")))
         if stage_name == "subtitle":
             # 注意：不能用 cues_en 判断，因为 download 阶段也会填充原始字幕。
-            # 断句阶段的完成标志是 stats 中记录的句子数（或无字幕标记）。
-            return bool(state.stats.get("sentences")) or bool(state.stats.get("no_subtitle"))
+            # 完成标志是 stats 中记录的句子数。
+            if state.stats.get("sentences"):
+                return True
+            if state.stats.get("no_subtitle"):
+                # 只有语音识别「已完成或已确定性失败」才算这个阶段做完了。
+                # 中断导致的半途而废必须重试，否则任务永远拿不到中文配音。
+                return bool(state.stats.get("asr_done"))
+            return False
         if stage_name == "translate":
             return paths.subtitle_zh.exists() and bool(state.cues_zh)
         if stage_name == "tts":

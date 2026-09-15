@@ -29,6 +29,7 @@ class PipelineConfig:
     general: dict[str, Any]
     translator: dict[str, Any]
     tts: dict[str, Any]
+    asr: dict[str, Any]
     download: dict[str, Any]
     publish: dict[str, Any]
     video: dict[str, Any]

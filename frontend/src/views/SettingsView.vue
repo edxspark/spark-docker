@@ -107,6 +107,35 @@ const FIELD_META: Record<string, FieldMeta> = {
   'tts.max_chars_per_request': { label: '单请求字符上限', type: 'number', min: 50, max: 300, help: '阿里云单次请求上限 300 字符，超长文本会自动按标点切分后拼接' },
   'tts.concurrency': { label: '合成并发数', type: 'number', min: 1, max: 16, help: '过高可能触发限流（错误码 429）' },
 
+  // 语音识别（无字幕兜底）
+  'asr.provider': {
+    label: '语音识别服务',
+    type: 'select',
+    options: [
+      { label: '阿里云智能语音交互（真实识别）', value: 'aliyun' },
+      { label: 'Mock（离线占位）', value: 'mock' },
+    ],
+    help: '凭证与「语音合成」共用同一个阿里云项目 AppKey，无需重复填写',
+  },
+  'asr.enabled': {
+    label: '无字幕时自动识别',
+    type: 'switch',
+    help: '视频没有字幕时，自动用语音识别生成原文，再翻译、配音并替换原音轨。关闭则保留原声',
+  },
+  'asr.language': { label: '识别语言', type: 'text', help: '仅用于提示。实际语种由阿里云控制台该项目的识别模型决定——英文视频必须选择英文模型，否则识别结果为空' },
+  'asr.max_chunk_seconds': { label: '单块时长上限（秒）', type: 'number', min: 5, max: 55, help: '阿里云单次请求音频不超过 60 秒，按静音边界切块，留出余量' },
+  'asr.concurrency': { label: '识别并发数', type: 'number', min: 1, max: 8, help: '并发过高可能触发限流（错误码 40000005）' },
+  'asr.silence_threshold_db': { label: '静音判定阈值（dB）', type: 'number', min: -60, max: -10, help: '低于该响度视为静音。背景音乐较响时可适当调高（如 -30）' },
+  'asr.min_silence_seconds': { label: '最短静音时长（秒）', type: 'number', min: 0.1, max: 3, step: 0.05, help: '用于切分语音块，避免把单词切成两半' },
+  'asr.remove_fillers': { label: '去除口语填充词', type: 'switch', help: '去掉「嗯」「呃」之类的词，译文更干净' },
+  'asr.max_duration_minutes': {
+    label: '识别时长上限（分钟）',
+    type: 'number',
+    min: 0,
+    max: 600,
+    help: '0 表示不限制。语音识别按音频时长计费，长视频建议设上限以避免意外开销',
+  },
+
   // 下载
   'download.format': { label: 'yt-dlp 格式', type: 'text', help: 'yt-dlp 的 -f 表达式，默认优先 1080p 以内的 mp4 以兼容抖音' },
   'download.max_height': {

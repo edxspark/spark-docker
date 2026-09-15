@@ -154,10 +154,31 @@ class GeneralConfig(BaseModel):
     auto_clean_failed: bool = False
 
 
+class ASRConfig(BaseModel):
+    """语音识别（无字幕视频的兜底）。凭证与「语音合成」共用同一个阿里云项目。"""
+
+    provider: Literal["aliyun", "mock"] = "aliyun"
+    # 无字幕时是否自动语音识别；关闭则保留原声不配音
+    enabled: bool = True
+    # 识别语言提示（仅用于日志与人为判断，实际语种由阿里云控制台的项目模型决定）
+    language: str = "en"
+    # 单块上限（秒）。阿里云单次请求音频不超过 60 秒，留出余量
+    max_chunk_seconds: int = Field(default=40, ge=5, le=55)
+    concurrency: int = Field(default=2, ge=1, le=8)
+    # 静音检测：低于该响度视为静音
+    silence_threshold_db: int = Field(default=-35, ge=-60, le=-10)
+    min_silence_seconds: float = Field(default=0.45, ge=0.1, le=3.0)
+    # 去掉「嗯/呃」等填充词
+    remove_fillers: bool = True
+    # 时长上限（分钟）。0 表示不限制。长视频识别按小时计费，设上限可避免意外开销
+    max_duration_minutes: int = Field(default=0, ge=0, le=600)
+
+
 CONFIG_MODELS: dict[str, type[BaseModel]] = {
     "general": GeneralConfig,
     "translator": TranslatorConfig,
     "tts": TTSConfig,
+    "asr": ASRConfig,
     "download": DownloadConfig,
     "publish": PublishConfig,
     "video": VideoConfig,
@@ -173,6 +194,7 @@ SECTION_LABELS = {
     "general": "通用",
     "translator": "翻译（DeepSeek）",
     "tts": "语音合成（阿里云 ISI）",
+    "asr": "语音识别（无字幕兜底）",
     "download": "下载（yt-dlp）",
     "publish": "发布（抖音）",
     "video": "成片合成",

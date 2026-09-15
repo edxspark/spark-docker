@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 
 from app.pipeline.context import ItemState, StageContext, make_threadsafe_progress
@@ -139,18 +140,22 @@ async def stage_download(ctx: StageContext, state: ItemState) -> None:
 
 
 async def stage_subtitle(ctx: StageContext, state: ItemState) -> None:
-    """字幕清洗与断句：把碎片化字幕合并成完整句子，便于逐句翻译配音。"""
-    await ctx.reporter.item_stage(state.item.id, "subtitle", 20, "整理字幕…", overall=ctx.overall_for("subtitle", 20))
+    """获取原文：优先用视频自带字幕；没有则用语音识别生成，再断句。"""
+    await ctx.reporter.item_stage(state.item.id, "subtitle", 10, "整理字幕…", overall=ctx.overall_for("subtitle", 10))
 
     if not state.cues_en:
-        # 没有字幕：标记为「原声直发」，跳过翻译/配音
+        await _acquire_subtitle_via_asr(ctx, state)
+
+    if not state.cues_en:
+        # 既没有字幕也无法识别：保留原声，跳过翻译/配音
         state.stats["no_subtitle"] = True
         await ctx.reporter.item_update(state.item.id, stats={**state.item.stats, **state.stats})
         await ctx.reporter.item_stage(
             state.item.id, "subtitle", 100, "无可用字幕，将保留原声", overall=ctx.overall_for("subtitle", 100)
         )
         await ctx.reporter.log(
-            "该视频没有英文字幕，已跳过翻译与配音，成片将保留原声（可在原视频开启自动字幕源后重试）",
+            "该视频没有字幕，语音识别也未能生成内容，成片将保留原声。"
+            "可在「系统配置 → 语音识别」中检查凭证与识别模型后重试。",
             level="warning",
             stage="subtitle",
             item_id=state.item.id,
@@ -161,12 +166,12 @@ async def stage_subtitle(ctx: StageContext, state: ItemState) -> None:
     max_duration = float(cfg.get("sentence_max_duration", 8.0))
     max_chars = int(cfg.get("sentence_max_chars", 120))
 
+    source_total = len(state.cues_en)
     merged = reindex(merge_into_sentences(state.cues_en, max_duration=max_duration, max_chars=max_chars))
     state.cues_en = merged
     state.paths.subtitle_en.parent.mkdir(parents=True, exist_ok=True)
     state.paths.subtitle_en.write_text(to_srt(merged), encoding="utf-8")
 
-    source_total = len(state.cues_en)
     state.stats["sentences"] = len(merged)
     await ctx.reporter.item_update(
         state.item.id,
@@ -190,3 +195,117 @@ async def stage_subtitle(ctx: StageContext, state: ItemState) -> None:
 async def ensure_video_present(state: ItemState) -> None:
     if not state.paths.video.exists():
         raise ProviderError(f"视频文件缺失：{state.paths.video}")
+
+
+async def _acquire_subtitle_via_asr(ctx: StageContext, state: ItemState) -> None:
+    """视频没有字幕时，用语音识别生成原文，后续照常翻译、配音、替换音轨。"""
+    asr_cfg = ctx.config.merged("asr")
+    if not asr_cfg.get("enabled", True):
+        await ctx.reporter.log(
+            "该视频没有字幕，且「语音识别」已关闭，将保留原声",
+            level="warning",
+            stage="subtitle",
+            item_id=state.item.id,
+        )
+        return
+
+    video = state.paths.video
+    if not video.exists():
+        return
+
+    factory = ctx.providers.get("asr_factory")
+    if factory is None:
+        return
+    try:
+        asr = factory()
+    except Exception as exc:  # noqa: BLE001 - 兜底能力不可用时不应中断任务
+        # 凭证缺失这类是确定性失败，标记后不再每轮重试都白跑一次
+        state.stats["asr_error"] = str(exc)[:500]
+        state.stats["asr_done"] = True
+        await ctx.reporter.item_update(state.item.id, stats={**state.item.stats, **state.stats})
+        await ctx.reporter.log(
+            f"该视频没有字幕，但语音识别不可用（{exc}），将保留原声",
+            level="warning",
+            stage="subtitle",
+            item_id=state.item.id,
+        )
+        return
+
+    # 注意：asr_done 只在「识别完成」或「确定性失败」时置位。
+    # 若在开始时置位，任务被中断后重试会直接跳过识别，用户永远拿不到配音
+    # （实际发生过：服务重载打断了识别，重试却因为该标记而跳过）。
+    provider = getattr(asr, "name", "unknown")
+    duration = state.item.duration or 0.0
+    await ctx.reporter.item_stage(
+        state.item.id,
+        "subtitle",
+        25,
+        "无字幕，正在语音识别…",
+        overall=ctx.overall_for("subtitle", 25),
+    )
+    await ctx.reporter.log(
+        f"该视频没有字幕，改用语音识别生成原文（{provider}，约 {duration / 60:.0f} 分钟音频，可能需要较长时间）",
+        stage="subtitle",
+        item_id=state.item.id,
+    )
+
+    loop = asyncio.get_running_loop()
+    schedule = make_threadsafe_progress(loop)
+
+    def on_progress(percent: float, message: str) -> None:
+        # 字幕阶段内占 25%~85%，其余留给断句
+        schedule(
+            ctx.reporter.item_stage(
+                state.item.id,
+                "subtitle",
+                25 + max(0.0, min(1.0, percent)) * 60,
+                message,
+                overall=ctx.overall_for("subtitle", 25 + max(0.0, min(1.0, percent)) * 60),
+            )
+        )
+
+    started = time.monotonic()
+    try:
+        cues = await asr.transcribe(
+            video,
+            on_progress=on_progress,
+            total_duration=duration or None,
+            # 分块结果落盘：中断后重试可直接复用，不必重新识别（省钱也省时间）
+            cache_dir=state.paths.work_dir / "asr",
+        )
+    except Exception as exc:  # noqa: BLE001 - 识别失败仍要产出成片（保留原声）
+        state.stats["asr_error"] = str(exc)[:500]
+        state.stats["asr_done"] = True
+        await ctx.reporter.item_update(state.item.id, stats={**state.item.stats, **state.stats})
+        await ctx.reporter.log(
+            f"语音识别失败，将保留原声：{exc}",
+            level="error",
+            stage="subtitle",
+            item_id=state.item.id,
+        )
+        return
+
+    if not cues:
+        state.stats["asr_error"] = "语音识别未返回任何内容"
+        state.stats["asr_done"] = True
+        await ctx.reporter.item_update(state.item.id, stats={**state.item.stats, **state.stats})
+        return
+
+    elapsed = time.monotonic() - started
+    state.cues_en = reindex(normalize_cues(cues))
+    state.stats["asr_done"] = True
+    state.stats["subtitle_source"] = {"kind": "asr", "cues": len(state.cues_en), "provider": provider}
+    state.stats["asr"] = {
+        "provider": provider,
+        "segments": len(state.cues_en),
+        "elapsed_seconds": round(elapsed, 1),
+        "characters": sum(len(c.text) for c in state.cues_en),
+    }
+    state.stats.pop("no_subtitle", None)
+    await ctx.reporter.item_update(state.item.id, stats={**state.item.stats, **state.stats})
+    await ctx.reporter.log(
+        f"语音识别完成：生成 {len(state.cues_en)} 条原文，耗时 {elapsed:.0f} 秒，"
+        "接下来将翻译并替换原音轨",
+        stage="subtitle",
+        item_id=state.item.id,
+    )

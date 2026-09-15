@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -38,6 +40,15 @@ def ffmpeg_available() -> bool:
     return bool(resolve_binary(settings.ffmpeg_bin)) and bool(resolve_binary(settings.ffprobe_bin))
 
 
+async def _reap(proc: asyncio.subprocess.Process) -> None:
+    """确保子进程被终止并回收，不留下僵尸进程或悬挂的传输对象。"""
+    if proc.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+    with contextlib.suppress(Exception):
+        await proc.wait()
+
+
 async def _run(cmd: list[str], *, timeout: float | None = None) -> tuple[int, str, str]:
     """执行外部命令，返回 (退出码, stdout, stderr)。超时会终止进程。"""
     proc = await asyncio.create_subprocess_exec(
@@ -48,10 +59,32 @@ async def _run(cmd: list[str], *, timeout: float | None = None) -> tuple[int, st
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
         raise FFmpegError(f"命令超时（{timeout}s）: {' '.join(cmd[:3])} ...") from None
+    finally:
+        # 无论成功、超时还是被取消，都要确保子进程被回收，
+        # 否则会留下僵尸进程，并让传输对象在事件循环关闭后才被 GC（告警/句柄泄漏）。
+        await _reap(proc)
     return proc.returncode or 0, stdout.decode("utf-8", "ignore"), stderr.decode("utf-8", "ignore")
+
+
+async def _run_bytes(cmd: list[str], *, timeout: float | None = None) -> tuple[int, bytes, str]:
+    """与 _run 相同，但 stdout 返回原始字节。
+
+    必须单独提供：_run 会用 errors="ignore" 按 UTF-8 解码，用于二进制数据
+    （例如 s16le PCM）时会静默丢弃大量字节——实测 610KB 的音频被削到 206KB。
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise FFmpegError(f"命令超时（{timeout}s）: {' '.join(cmd[:3])} ...") from None
+    finally:
+        await _reap(proc)
+    return proc.returncode or 0, stdout or b"", (stderr or b"").decode("utf-8", "ignore")
 
 
 async def run_ffmpeg(args: list[str], *, timeout: float | None = 3600) -> None:
@@ -435,4 +468,138 @@ async def render_final(
 async def extract_cover(video: Path, out_path: Path, *, at: float = 1.0) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     await run_ffmpeg(["-ss", f"{at:.2f}", "-i", str(video), "-frames:v", "1", "-q:v", "3", str(out_path)])
+    return out_path
+
+
+_SILENCE_START_RE = re.compile(r"silence_start:\s*(-?[\d.]+)")
+_SILENCE_END_RE = re.compile(r"silence_end:\s*(-?[\d.]+)")
+
+
+async def detect_speech_segments(
+    media: Path,
+    *,
+    noise_db: float = -35.0,
+    min_silence: float = 0.45,
+    total_duration: float | None = None,
+) -> list[tuple[float, float]]:
+    """用 ffmpeg 的 silencedetect 找出「有人在说话」的区间。
+
+    用途：ASR 需要把长音频切片送识别接口。按静音边界切，可以避免把单词切成两半，
+    并且每个切片的起始时间就是真实的语音起点，比等分切割的对轴精度高得多。
+    """
+    cmd = [
+        _bin(settings.ffmpeg_bin), "-hide_banner", "-nostats",
+        "-i", str(media),
+        "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}",
+        "-f", "null", "-",
+    ]
+    code, _, stderr = await _run(cmd, timeout=1800)
+    # silencedetect 把结果写在 stderr；即使退出码非 0 也常能拿到部分结果
+    if code != 0 and "silence_" not in stderr:
+        raise FFmpegError(f"静音检测失败: {stderr.strip()[-500:]}")
+
+    silence_starts = [float(m) for m in _SILENCE_START_RE.findall(stderr)]
+    silence_ends = [float(m) for m in _SILENCE_END_RE.findall(stderr)]
+
+    duration = total_duration
+    if duration is None:
+        duration = (await probe(media)).duration
+    if duration <= 0:
+        return []
+
+    # 由静音区间反推语音区间
+    silences: list[tuple[float, float]] = []
+    for index, start in enumerate(silence_starts):
+        end = silence_ends[index] if index < len(silence_ends) else duration
+        silences.append((max(0.0, start), min(duration, max(start, end))))
+
+    speech: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in silences:
+        if start - cursor > 0.05:
+            speech.append((cursor, start))
+        cursor = max(cursor, end)
+    if duration - cursor > 0.05:
+        speech.append((cursor, duration))
+
+    # 完全没有检测到静音（例如全程连续说话）时，退化为整段
+    if not speech and duration > 0:
+        speech = [(0.0, duration)]
+    return speech
+
+
+def group_segments(
+    segments: list[tuple[float, float]],
+    *,
+    max_duration: float = 40.0,
+) -> list[tuple[float, float]]:
+    """把语音区间整理成不超过 max_duration 的连续块。
+
+    两个方向都要处理：
+    - 合并：相邻的短语音段并到一起，减少 ASR 请求次数；
+    - **切分**：单个语音段自身就超过上限时必须切开——连续说话（几乎没有静音）的视频
+      会检测出「一整段」，若不切开就变成一个远超接口 60 秒限制的巨型请求。
+    """
+    max_duration = max(1.0, max_duration)
+    chunks: list[tuple[float, float]] = []
+    current_start: float | None = None
+    current_end = 0.0
+
+    def flush() -> None:
+        nonlocal current_start, current_end
+        if current_start is not None and current_end > current_start:
+            chunks.append((current_start, current_end))
+        current_start, current_end = None, 0.0
+
+    for start, end in segments:
+        if end <= start:
+            continue
+        cursor = start
+        while cursor < end - 0.05:
+            piece_end = min(end, cursor + max_duration)
+            if current_start is None:
+                current_start, current_end = cursor, piece_end
+            elif piece_end - current_start <= max_duration:
+                current_end = piece_end
+            else:
+                flush()
+                current_start, current_end = cursor, piece_end
+            cursor = piece_end
+    flush()
+    return chunks
+
+
+async def extract_pcm(
+    media: Path,
+    *,
+    start: float,
+    duration: float,
+    sample_rate: int = 16000,
+) -> bytes:
+    """抽取指定区间的单声道 16bit PCM 原始数据（阿里云一句话识别要求此格式）。"""
+    cmd = [
+        _bin(settings.ffmpeg_bin), "-hide_banner", "-loglevel", "error",
+        "-ss", f"{max(0.0, start):.3f}",
+        "-t", f"{max(0.05, duration):.3f}",
+        "-i", str(media),
+        "-vn", "-ac", "1", "-ar", str(sample_rate),
+        "-f", "s16le", "-acodec", "pcm_s16le", "-",
+    ]
+    code, raw, stderr = await _run_bytes(cmd, timeout=600)
+    if code != 0:
+        raise FFmpegError(f"音频抽取失败: {stderr.strip()[-400:]}")
+    if not raw:
+        raise FFmpegError("音频抽取结果为空：源文件可能没有音轨")
+    return raw
+
+
+async def extract_audio_track(media: Path, out_path: Path, *, sample_rate: int = 16000) -> Path:
+    """把视频的音轨导出为单声道 16k PCM WAV，供 ASR 使用。"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    await run_ffmpeg([
+        "-i", str(media),
+        "-vn", "-ac", "1", "-ar", str(sample_rate),
+        "-c:a", "pcm_s16le",
+        str(out_path),
+    ])
     return out_path
