@@ -251,3 +251,109 @@ class TestPublishButtonSelector:
         exact_text = "发布"
         assert exact_text in nav_item, "导航项确实包含「发布」子串，这正是陷阱所在"
         assert nav_item != exact_text, "两者文本不同，精确匹配可区分"
+
+
+class TestCoverSelectors:
+    """事故：发布出去的视频没有封面（平台显示黑底）。
+
+    根因候选之一是封面弹窗里有两个上传槽位，选错就会把封面塞进
+    「AI 封面参考图」而非真正的「上传封面」。实地用真实账号验证：
+      精确选择器命中 1 个，而 input.semi-upload-hidden-input 共有 2 个。
+    """
+
+    def test_upload_selector_targets_main_drag_area(self):
+        """必须按拖拽区文案定位，才能与「生成参考图」槽位区分开。"""
+        from app.providers.publisher.douyin import COVER_UPLOAD_INPUT_SELECTOR
+
+        assert "semi-upload-drag-area-main-text" in COVER_UPLOAD_INPUT_SELECTOR, (
+            "未按拖拽区文案限定，会命中 AI 封面参考图的槽位"
+        )
+        assert "semi-upload-hidden-input" in COVER_UPLOAD_INPUT_SELECTOR
+
+    def test_modal_selector_matches_creator_modal(self):
+        from app.providers.publisher.douyin import COVER_MODAL_SELECTOR
+
+        assert COVER_MODAL_SELECTOR == "div.dy-creator-content-modal"
+
+    def test_trigger_texts_cover_known_labels(self):
+        from app.providers.publisher.douyin import COVER_TRIGGER_TEXTS
+
+        for text in ("编辑封面", "选择封面", "设置封面"):
+            assert text in COVER_TRIGGER_TEXTS
+
+    def test_onboarding_overlay_is_cleared(self):
+        """shepherd 新手引导浮层会拦截封面区点击，必须清理。"""
+        from app.providers.publisher.douyin import ONBOARDING_SELECTORS
+
+        assert ONBOARDING_SELECTORS, "必须处理引导浮层，否则封面弹窗打不开"
+        assert any("shepherd" in s for s in ONBOARDING_SELECTORS)
+
+
+class TestWaitUntilEnabled:
+    """封面图处理完之前「完成」是禁用状态，点了无效且弹窗关不掉。"""
+
+    async def test_returns_true_when_enabled(self):
+        from app.providers.publisher.douyin import _wait_until_enabled
+
+        class Enabled:
+            async def get_attribute(self, _name):
+                return "semi-button semi-button-primary"
+
+            async def is_enabled(self):
+                return True
+
+        assert await _wait_until_enabled(Enabled(), timeout=2000) is True
+
+    async def test_waits_for_disabled_to_clear(self):
+        import time
+
+        from app.providers.publisher.douyin import _wait_until_enabled
+
+        class EventuallyEnabled:
+            def __init__(self):
+                self.calls = 0
+
+            async def get_attribute(self, _name):
+                self.calls += 1
+                return "semi-button" if self.calls >= 3 else "semi-button semi-button-disabled"
+
+            async def is_enabled(self):
+                return True
+
+        start = time.time()
+        assert await _wait_until_enabled(EventuallyEnabled(), timeout=5000) is True
+        assert time.time() - start >= 0.5, "应当轮询等待而不是立刻返回"
+
+    async def test_returns_false_on_timeout(self):
+        from app.providers.publisher.douyin import _wait_until_enabled
+
+        class AlwaysDisabled:
+            async def get_attribute(self, _name):
+                return "semi-button semi-button-disabled"
+
+            async def is_enabled(self):
+                return False
+
+        assert await _wait_until_enabled(AlwaysDisabled(), timeout=1000) is False
+
+
+class TestCoverFailureIsVisible:
+    """封面失败不能被静默吞掉——用户只看到成片，根本不知道封面没设上。"""
+
+    async def test_set_cover_returns_bool(self):
+        import inspect
+
+        from app.providers.publisher.douyin import DouyinPublisher
+
+        signature = inspect.signature(DouyinPublisher._set_cover)
+        assert signature.return_annotation in (bool, "bool"), (
+            "封面设置必须返回结果，供调用方记录，而不是静默失败"
+        )
+
+    def test_publish_logs_warning_when_cover_missing(self):
+        import inspect
+
+        from app.providers.publisher.douyin import DouyinPublisher
+
+        source = inspect.getsource(DouyinPublisher)
+        assert "封面未设置成功" in source, "封面失败时应留下明确告警"

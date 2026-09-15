@@ -87,6 +87,29 @@ UPLOAD_FAILED_SELECTORS = (
     'text=上传失败',
 )
 
+# 封面弹窗内的上传输入框。
+# 弹窗里有两个 input.semi-upload-hidden-input（各自还带一个 -replace 兄弟）：
+#   ① 左侧「生成参考图」——AI 封面参考图槽，拖拽区 class 为 semi-upload-drag-area-custom
+#   ② 帧选择区「上传封面」——拖拽区含 .semi-upload-drag-area-main-text
+# 若用 .first 取到 ①，封面会被塞进 AI 参考图槽：真封面没设上，成片仍是黑封面，
+# 而且弹窗里的检测会一直转、「完成」按钮永远不解禁。
+COVER_UPLOAD_INPUT_SELECTOR = (
+    ".semi-upload:has(.semi-upload-drag-area-main-text) input.semi-upload-hidden-input"
+)
+COVER_MODAL_SELECTOR = "div.dy-creator-content-modal"
+COVER_TRIGGER_TEXTS = ("编辑封面", "选择封面", "设置封面")
+COVER_AREA_SELECTORS = (
+    '[class*="cover-"]',
+    '[class*="cover"]',
+)
+# 抖音的新手引导浮层会拦截封面区的点击，导致弹窗打不开
+ONBOARDING_SELECTORS = (
+    ".shepherd-element",
+    ".shepherd-modal-overlay-container",
+    "[class*='shepherd']",
+)
+
+
 # 需要人工介入的风控/校验：无头模式下无法自动通过，命中后应降级为有头
 VERIFICATION_SELECTORS = (
     "text=身份验证",
@@ -169,6 +192,44 @@ async def _resolve_publish_button(page, *, timeout: float = 5000):
                 continue
         await asyncio.sleep(0.3)
     return None
+
+
+async def _dismiss_onboarding(page) -> None:
+    """清掉新手引导浮层。
+
+    shepherd 引导层会盖在封面区上方拦截点击，表现为「封面弹窗打不开」。
+    """
+    for selector in ONBOARDING_SELECTORS:
+        try:
+            locator = page.locator(selector)
+            count = await locator.count()
+            for i in range(count):
+                item = locator.nth(i)
+                if await item.is_visible():
+                    await item.evaluate(
+                        "el => el.parentNode && el.parentNode.removeChild(el)"
+                    )
+        except Exception:  # noqa: BLE001
+            continue
+
+
+async def _wait_until_enabled(locator, *, timeout: float = 20000) -> bool:
+    """等按钮解除禁用。
+
+    封面上传后抖音要处理图片，期间「完成」带 semi-button-disabled，点了无效——
+    直接点会导致弹窗关不掉，进而挡住后面的发布按钮。
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout / 1000
+    while loop.time() < deadline:
+        try:
+            cls = (await locator.get_attribute("class")) or ""
+            if "semi-button-disabled" not in cls and await locator.is_enabled():
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(0.4)
+    return False
 
 
 async def _dismiss_overlays(page) -> None:
@@ -560,8 +621,14 @@ class DouyinPublisher(BasePublisher):
                 logger.info("[发布] 4/6 视频上传完成")
 
                 logger.info("[发布] 5/6 设置封面与声明…")
-                # 4) 封面
-                await self._set_cover(page, request)
+                # 4) 封面。失败不阻断发布，但必须如实记录——
+                #    封面没设上会直接导致发布出去的视频显示黑底，用户光看成片看不出原因。
+                cover_ok = await self._set_cover(page, request)
+                if not cover_ok:
+                    logger.warning(
+                        "封面未设置成功，发布后的作品可能没有封面（平台显示黑底）。"
+                        "可到创作者中心手动设置，或检查成片是否已生成封面图"
+                    )
 
                 # 5) AI 生成声明（本流水线含 AI 配音与 AI 字幕，如实声明）
                 await self._apply_ai_declaration(page)
@@ -750,47 +817,149 @@ class DouyinPublisher(BasePublisher):
             await asyncio.sleep(2)
         raise ProviderError(f"等待视频上传完成超时（{self.config.timeout}s）")
 
-    async def _set_cover(self, page, request: PublishRequest) -> None:
-        """有自定义封面就上传；否则让抖音自动选推荐封面。"""
+    async def _set_cover(self, page, request: PublishRequest) -> bool:
+        """设置封面。成功返回 True。
+
+        失败不再静默：封面设不上会直接导致发布出去的视频没有封面（平台显示黑底），
+        用户只能看到成片却看不出原因，因此这里把结论如实返回给调用方记录。
+        """
+        cover = Path(request.cover_path) if request.cover_path else None
+        if cover is None or not cover.exists():
+            return await self._use_recommended_cover(page)
+
+        # 1) 打开封面弹窗（引导浮层会拦截点击，先清掉）
+        await _dismiss_onboarding(page)
+        if not await self._open_cover_dialog(page):
+            await _dismiss_onboarding(page)
+            if not await self._open_cover_dialog(page):
+                logger.warning("封面弹窗打不开，改用平台推荐封面")
+                return await self._use_recommended_cover(page)
+
+        modal = page.locator(COVER_MODAL_SELECTOR).first
+        if await modal.count() == 0:
+            logger.warning("未找到封面弹窗容器，改用平台推荐封面")
+            return await self._use_recommended_cover(page)
+
+        # 2) 定位「上传封面」的输入框。
+        #    必须按拖拽区文案精确定位：弹窗里另一个隐藏 input 属于左侧
+        #    「生成参考图」（AI 封面参考图）槽位，传错地方会导致真封面没设上、
+        #    成片依旧没有封面，且「完成」按钮永远不解禁。
+        upload = modal.locator(COVER_UPLOAD_INPUT_SELECTOR).first
+        if await upload.count() == 0:
+            upload = modal.locator("input.semi-upload-hidden-input").last
+        if await upload.count() == 0:
+            upload = modal.locator('input[type="file"]').last
+        if await upload.count() == 0:
+            logger.warning("封面弹窗里没有找到上传入口，改用平台推荐封面")
+            return await self._use_recommended_cover(page)
+
+        # 3) 优先设置竖版封面（抖音推荐竖屏），弹窗默认就在该页
         try:
-            if request.cover_path and Path(request.cover_path).exists():
-                opened = await self._open_cover_dialog(page)
-                if not opened:
-                    return
-                modal = page.locator("div.dy-creator-content-modal").first
-                if await modal.count() == 0:
-                    return
-                file_input = modal.locator('input[type="file"]').last
-                if await file_input.count():
-                    await file_input.set_input_files(str(request.cover_path))
-                    await page.wait_for_timeout(2500)
-                done_button = modal.locator('button:has-text("完成")').first
-                if await done_button.count():
-                    await done_button.click()
-                    await page.wait_for_timeout(1500)
-            elif await _exists(page, ("text=请设置封面后再发布",)):
-                recommend = page.locator('[class^="recommendCover-"]').first
-                if await recommend.count():
-                    await recommend.click()
+            portrait_tab = modal.get_by_text("设置竖封面", exact=True).first
+            if await portrait_tab.count():
+                await portrait_tab.click(timeout=3000)
+                await page.wait_for_timeout(600)
+        except Exception:  # noqa: BLE001 - 已在目标页时点击会失败，忽略
+            pass
+
+        await upload.set_input_files(str(cover))
+        await page.wait_for_timeout(3000)
+
+        # 4) 等「完成」解禁：图片处理完之前它是 disabled，点了无效
+        done = modal.get_by_role("button", name="完成", exact=True).first
+        if await done.count() == 0:
+            done = modal.locator('button:has-text("完成")').first
+        if await done.count() == 0:
+            logger.warning("封面弹窗里没有「完成」按钮，改用平台推荐封面")
+            return await self._use_recommended_cover(page)
+
+        if not await _wait_until_enabled(done, timeout=20000):
+            logger.warning("封面图处理超时，「完成」始终处于禁用状态")
+            await _dismiss_overlays(page)
+            return False
+
+        if not await _native_click(page, done):
+            try:
+                await done.click(timeout=5000)
+            except Exception:  # noqa: BLE001
+                logger.warning("无法点击封面「完成」按钮")
+                return False
+        await page.wait_for_timeout(1800)
+
+        # 5) 校验弹窗确实关掉了——它还开着的话会盖住发布按钮
+        try:
+            still_open = await page.locator(COVER_MODAL_SELECTOR).first.is_visible()
+        except Exception:  # noqa: BLE001
+            still_open = False
+        if still_open:
+            logger.warning("封面弹窗未能关闭，尝试用 Esc 收起")
+            await _dismiss_overlays(page)
+        logger.info("自定义封面上传完成：%s", cover.name)
+        return True
+
+    async def _use_recommended_cover(self, page) -> bool:
+        """兜底：使用抖音推荐的封面帧，至少不会是没有封面的黑底。"""
+        try:
+            if not await _exists(page, ("text=请设置封面后再发布",)):
+                return False
+            recommend = page.locator('[class^="recommendCover-"]').first
+            if await recommend.count():
+                await _native_click(page, recommend)
+                await page.wait_for_timeout(800)
+                confirm = page.get_by_role("button", name="确定").first
+                if await confirm.count():
+                    await _native_click(page, confirm)
                     await page.wait_for_timeout(800)
-                    confirm = page.get_by_role("button", name="确定").first
-                    if await confirm.count():
-                        await confirm.click()
-                        await page.wait_for_timeout(800)
+                logger.info("已选用平台推荐封面")
+                return True
         except Exception as exc:  # noqa: BLE001
-            logger.warning("封面设置未完成（不影响发布主流程）：%s", exc)
+            logger.warning("选择推荐封面失败：%s", exc)
+        return False
 
     async def _open_cover_dialog(self, page) -> bool:
-        candidates = ("text=选择封面", "text=编辑封面", "text=设置封面")
-        for text in candidates:
-            locator = page.get_by_text(text, exact=True).first
+        """打开封面编辑弹窗。
+
+        封面区的点击入口只在 hover 后才浮现，且抖音自定义组件对普通 click 常静默
+        失效，因此这里：hover → 用原生事件点击 → 校验弹窗是否真的出现 → 重试。
+        """
+        modal = page.locator(COVER_MODAL_SELECTOR).first
+        if await modal.count() and await modal.is_visible():
+            return True
+
+        area = None
+        for selector in COVER_AREA_SELECTORS:
+            candidate = page.locator(selector).filter(has=page.locator("img")).first
             try:
-                if await locator.count():
-                    await locator.click(timeout=5000)
-                    await page.wait_for_timeout(1500)
-                    return True
+                if await candidate.count():
+                    area = candidate
+                    break
             except Exception:  # noqa: BLE001
                 continue
+        if area is None:
+            return False
+
+        with contextlib.suppress(Exception):
+            await area.scroll_into_view_if_needed(timeout=5000)
+        for _ in range(3):
+            with contextlib.suppress(Exception):
+                await area.hover()
+                await page.wait_for_timeout(600)
+
+            trigger = None
+            for text in COVER_TRIGGER_TEXTS:
+                candidate = page.get_by_text(text, exact=True).first
+                with contextlib.suppress(Exception):
+                    if await candidate.count() and await candidate.is_visible():
+                        trigger = candidate
+                        break
+
+            target = trigger if trigger is not None else area
+            await _native_click(page, target)
+            with contextlib.suppress(Exception):
+                await modal.wait_for(state="visible", timeout=5000)
+            if await modal.count() and await modal.is_visible():
+                return True
+            await page.wait_for_timeout(800)
         return False
 
     async def _apply_ai_declaration(self, page, declaration: str = "内容由AI生成") -> None:
@@ -862,9 +1031,7 @@ class DouyinPublisher(BasePublisher):
                 return
             except Exception:  # noqa: BLE001
                 if await _exists(page, ("text=请设置封面后再发布",)):
-                    await self._set_cover(
-                        page, PublishRequest(video_path=Path(), title="", cover_path=None)
-                    )
+                    await self._use_recommended_cover(page)
                 await page.wait_for_timeout(1200)
 
         raise ProviderError(f"点击发布后未跳转到作品管理页（{last_reason}），请在抖音后台确认发布状态")
