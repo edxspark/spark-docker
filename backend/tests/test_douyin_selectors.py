@@ -217,3 +217,37 @@ class TestClickReachability:
                 return None
 
         assert await _can_click_at(None, NoBox()) is False
+
+
+class TestPublishButtonSelector:
+    """事故复盘：发布按钮必须精确匹配文本。
+
+    原选择器是 `button:has-text("发布")` —— 子串匹配会同时命中左侧导航项
+    「作品发布」（文本里含「发布」二字），而 .first 取到的正是那个导航项。
+    于是「点发布」实际点了导航，页面跳到 content/upload，作品根本没提交，
+    却表现为「点击后未跳转到作品管理页」，把排查方向完全带偏。
+    实测该页面 has-text 命中 2 个，text-is 精确命中 1 个。
+    """
+
+    def test_no_substring_matching_in_publish_selectors(self):
+        from app.providers.publisher.douyin import PUBLISH_BUTTON_SELECTORS
+
+        for selector in PUBLISH_BUTTON_SELECTORS:
+            assert ":has-text(" not in selector, (
+                f"发布按钮不能用子串匹配（{selector}）——会命中「作品发布」导航项"
+            )
+            assert 'text-is("发布")' in selector or "exact" in selector, selector
+
+    def test_selectors_target_exact_publish_text(self):
+        from app.providers.publisher.douyin import PUBLISH_BUTTON_SELECTORS
+
+        assert any('button:text-is("发布")' == s for s in PUBLISH_BUTTON_SELECTORS), (
+            "首选应是精确文本匹配"
+        )
+
+    def test_regression_documents_the_nav_item_trap(self):
+        """「作品发布」会命中 has-text("发布")，这个事实必须被记录。"""
+        nav_item = "作品发布"
+        exact_text = "发布"
+        assert exact_text in nav_item, "导航项确实包含「发布」子串，这正是陷阱所在"
+        assert nav_item != exact_text, "两者文本不同，精确匹配可区分"

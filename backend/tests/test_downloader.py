@@ -477,12 +477,18 @@ class TestHeadlessPublishFallback:
         ):
             assert _needs_human(RuntimeError(message)) is False, message
 
-    def test_headless_is_the_default(self):
+    def test_visible_browser_is_the_default(self):
+        """默认可见浏览器：发布过程可观察，遇到验证码人能直接接手。
+
+        （曾把默认改成无头以避免弹窗，但无头既看不到中间状态、又更容易被
+        平台识别，最终还是回到可见浏览器。）
+        """
         from app.services.settings_store import PublishConfig
 
         config = PublishConfig()
-        assert config.headless is True, "默认应无头，避免弹出浏览器窗口"
-        assert config.headless_fallback_to_visible is True
+        assert config.headless is False, "默认应打开可见浏览器窗口"
+        assert config.keep_browser_on_failure is True, "失败时应保留窗口供查看"
+        assert config.failure_hold_seconds > 0
 
     async def test_falls_back_to_visible_on_verification(self, monkeypatch):
         from app.providers.base import ProviderError, PublishRequest

@@ -67,9 +67,16 @@ SCHEDULE_INPUT_SELECTORS = (
     '.semi-input[placeholder="日期和时间"]',
     'input[placeholder="日期和时间"]',
 )
+# 提交按钮必须精确匹配文本。
+# 事故复盘：原先用 button:has-text("发布") —— 子串匹配会同时命中左侧导航项
+# 「作品发布」（文本里含「发布」二字），而 .first 拿到的正是那个导航项，
+# 于是「点发布」实际是点了导航，页面跳到 content/upload，作品根本没提交，
+# 却表现为「点击后未跳转到作品管理页」，排查方向被完全带偏。
+# 实测该页面上 has-text 命中 2 个，text-is 精确命中 1 个。
 PUBLISH_BUTTON_SELECTORS = (
-    'button:has-text("发布")',
-    'button.semi-button-primary:has-text("发布")',
+    'button:text-is("发布")',
+    'button.semi-button-primary:text-is("发布")',
+    'button.semi-button:text-is("发布")',
 )
 UPLOAD_DONE_SELECTORS = (
     '[class^="long-card"] div:has-text("重新上传")',
@@ -140,6 +147,28 @@ def _require_playwright():
         raise ProviderError(
             "未安装浏览器驱动：请执行 `uv pip install patchright` 并 `patchright install chromium`"
         ) from exc
+
+
+async def _resolve_publish_button(page, *, timeout: float = 5000):
+    """定位「发布」提交按钮。
+
+    优先用 get_by_role(name, exact=True)：只有精确文本匹配才能把提交按钮
+    和文本里同样包含「发布」的左侧导航项「作品发布」区分开。
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout / 1000
+    while loop.time() < deadline:
+        for locator in (
+            page.get_by_role("button", name="发布", exact=True).last,
+            page.locator('button:text-is("发布")').last,
+        ):
+            try:
+                if await locator.count():
+                    return locator
+            except Exception:  # noqa: BLE001
+                continue
+        await asyncio.sleep(0.3)
+    return None
 
 
 async def _dismiss_overlays(page) -> None:
@@ -476,6 +505,8 @@ class DouyinPublisher(BasePublisher):
 
         async with async_playwright() as playwright:
             browser, context = await _new_context(playwright, self.account_file, headless)
+            page = None
+            failure: Exception | None = None
             try:
                 page = await context.new_page()
                 page.set_default_timeout(min(timeout_ms, 120000))
@@ -491,7 +522,7 @@ class DouyinPublisher(BasePublisher):
                         "请保持「无头模式」关闭后重试，在弹窗中人工完成验证"
                     )
 
-                # 1) 选择文件并等待跳转到发布页
+                logger.info("[发布] 1/6 定位上传入口…")
                 # 文件输入框在页面上是 1x1 的隐藏元素，用 attached 而非 visible
                 upload_input = await _first_visible(
                     page, UPLOAD_INPUT_SELECTORS, timeout=60000, state="attached"
@@ -513,16 +544,22 @@ class DouyinPublisher(BasePublisher):
                         "若确实已改版，请更新 douyin.py 顶部的 UPLOAD_INPUT_SELECTORS"
                     )
                 await upload_input.set_input_files(str(video_path))
+                logger.info("[发布] 2/6 等待进入发布页…")
                 await self._wait_publish_page(page, timeout_ms)
+                logger.info("[发布] 2/6 已进入发布页")
 
                 # 2) 标题 / 正文 / 话题
+                logger.info("[发布] 3/6 填标题与正文…")
                 await self._fill_title_and_description(
                     page, request.title, request.description, request.tags
                 )
 
                 # 3) 等待上传完成（长视频耗时较长）
+                logger.info("[发布] 4/6 等待视频上传完成（超时 %ss）…", self.config.timeout)
                 await self._wait_upload_finished(page, video_path, timeout_ms)
+                logger.info("[发布] 4/6 视频上传完成")
 
+                logger.info("[发布] 5/6 设置封面与声明…")
                 # 4) 封面
                 await self._set_cover(page, request)
 
@@ -533,6 +570,7 @@ class DouyinPublisher(BasePublisher):
                 if request.schedule_at:
                     await self._set_schedule(page, request.schedule_at)
 
+                logger.info("[发布] 6/6 点击发布…")
                 # 7) 发布（干跑时到此为止）
                 if request.dry_run:
                     checks = await self._dry_run_report(page)
@@ -568,14 +606,53 @@ class DouyinPublisher(BasePublisher):
                     message="发布成功" + (f"（定时 {request.schedule_at}）" if request.schedule_at else ""),
                     raw={"headless": headless},
                 )
-            except ProviderError:
+            except ProviderError as exc:
+                failure = exc
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.exception("抖音发布失败")
+                failure = exc
                 raise ProviderError(f"抖音发布失败：{exc}") from exc
             finally:
+                # 可见模式下失败时把窗口留住：否则窗口一闪而过，
+                # 用户既看不到卡在哪一步，也没机会接手处理验证码。
+                if failure is not None and page is not None and not headless:
+                    await self._hold_for_inspection(page, failure)
                 await context.close()
                 await browser.close()
+
+    async def _hold_for_inspection(self, page, failure: Exception) -> None:
+        """失败时保留浏览器窗口，供人工查看当前页面并处理验证码。
+
+        等待期间若用户手动关闭了窗口则立即结束；也支持在窗口里直接操作
+        （例如通过滑块验证），操作完关掉窗口即可。
+        """
+        if not self.config.keep_browser_on_failure:
+            return
+        hold = int(self.config.failure_hold_seconds or 0)
+        if hold <= 0:
+            return
+
+        screenshot_path = Path(self.account_file).with_suffix(".failed.png")
+        try:
+            await page.screenshot(path=str(screenshot_path), full_page=True)
+        except Exception:  # noqa: BLE001
+            screenshot_path = None  # type: ignore[assignment]
+
+        logger.warning(
+            "发布失败，浏览器窗口将保留 %s 秒供你查看（截图：%s）：%s",
+            hold,
+            screenshot_path or "未保存",
+            str(failure)[:200],
+        )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + hold
+        while loop.time() < deadline:
+            if page.is_closed():
+                logger.info("检测到窗口已关闭，提前结束等待")
+                return
+            await asyncio.sleep(1)
 
     async def _dry_run_report(self, page) -> dict:
         """干跑时的关键校验：确认走到发布页、标题已填、上传已完成、发布按钮可点。"""
@@ -767,7 +844,7 @@ class DouyinPublisher(BasePublisher):
         while loop.time() < deadline:
             await _dismiss_overlays(page)
 
-            button = await _first_visible(page, PUBLISH_BUTTON_SELECTORS, timeout=5000)
+            button = await _resolve_publish_button(page)
             if button is not None:
                 if await _native_click(page, button):
                     last_reason = "已点击发布按钮，但页面未跳转"
