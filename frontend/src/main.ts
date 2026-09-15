@@ -7,7 +7,13 @@ import 'element-plus/dist/index.css'
 
 import App from './App.vue'
 import router from './router'
+import { themeVars } from './theme'
 import './styles/main.css'
+
+// 主题色变量必须在 Element Plus 样式之后注入，才能覆盖它的默认蓝色
+for (const [name, value] of Object.entries(themeVars)) {
+  document.documentElement.style.setProperty(name, value)
+}
 
 const app = createApp(App)
 

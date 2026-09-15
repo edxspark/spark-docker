@@ -10,6 +10,7 @@ import StageProgress from '@/components/StageProgress.vue'
 import VideoPreviewDialog from '@/components/VideoPreviewDialog.vue'
 import {
   STAGE_LABELS,
+  copyText,
   elapsedText,
   formatDateTime,
   formatDuration,
@@ -58,6 +59,15 @@ const progressStatus = computed(() => {
 })
 
 const canCancel = computed(() => ['pending', 'running'].includes(detail.value?.status || ''))
+
+/** 已完成成片、等待人工确认发布的条目（默认手动发布流程的待办） */
+const pendingPublishItems = computed(
+  () =>
+    (detail.value?.items || []).filter(
+      (item) => item.output_path && ['', 'pending', 'skipped'].includes(item.publish_status || ''),
+    ),
+)
+
 const canRetry = computed(() => {
   if (!detail.value) return false
   return (
@@ -218,12 +228,30 @@ function openPreview(item: TaskItem) {
   previewOpen.value = true
 }
 
-async function handlePublish(item: TaskItem) {
+async function handlePublish(item: TaskItem, republish = false) {
   if (!taskId.value) return
+
+  if (republish) {
+    // 抖音不会用新上传替换旧作品，重发必然多出一个作品，必须先讲清楚
+    try {
+      await ElMessageBox.confirm(
+        '重新发布会向抖音再上传一个「新作品」，旧的已发布作品不会自动删除，' +
+          '需要你到创作者中心手动删除旧的那条。\n\n' +
+          '确认要重新发布吗？',
+        '重新发布到抖音',
+        { type: 'warning', confirmButtonText: '重新发布', cancelButtonText: '取消' },
+      )
+    } catch {
+      return
+    }
+  }
+
   publishingId.value = item.id
   try {
-    const updated = await taskApi.publishItem(taskId.value, item.id)
-    ElMessage.success(`发布成功${updated.publish_url ? '：' + updated.publish_url : ''}`)
+    const updated = await taskApi.publishItem(taskId.value, item.id, { republish })
+    ElMessage.success(
+      `${republish ? '重新发布' : '发布'}成功${updated.publish_url ? '：' + updated.publish_url : ''}`,
+    )
     reload().catch(() => undefined)
   } catch {
     /* 拦截器已提示 */
@@ -232,8 +260,71 @@ async function handlePublish(item: TaskItem) {
   }
 }
 
+/** 近几次发布尝试，用于展示「重新发布」的结果 */
+function publishHistory(item: TaskItem): Record<string, any>[] {
+  const history = (item.stats?.publish_history ?? []) as Record<string, any>[]
+  return [...history].reverse()
+}
+
 function truncateLog(message: string, max = 60): string {
   return message.length > max ? `${message.slice(0, max - 1)}…` : message
+}
+
+/**
+ * 条目封面的候选地址，按「本地优先」排序。
+ *
+ * 之前直接用 row.thumbnail（i.ytimg.com 外链）：本机网络访问不到 YouTube 图床时，
+ * 图片永远加载不出来，条目上就只剩一个灰色占位图标——而封面其实早就随任务下载到本地
+ * （data/covers/<task>/<video>.jpg，实测约 370KB）。现在优先走后端本地文件接口，
+ * 外链只作兜底。
+ */
+function thumbSources(item: TaskItem): string[] {
+  if (taskId.value == null) return ['']
+  const sources: string[] = []
+  // 1) 下载时落盘的 YouTube 缩略图（16:9，与列表里的 88x50 槽位同形状）
+  sources.push(`${taskApi.fileUrl(taskId.value, item.id, 'thumbnail')}&inline=1`)
+  // 2) 成片抽帧的竖版封面（会裁切，但至少是本地的）
+  if (item.cover_path) {
+    sources.push(`${taskApi.fileUrl(taskId.value, item.id, 'cover')}&inline=1`)
+  }
+  // 3) 最后才用 YouTube 外链（本机无代理时不可达）
+  if (item.thumbnail) sources.push(item.thumbnail)
+  return sources
+}
+
+/** 每个条目当前用到第几个候选地址；前一个加载失败就降级到下一个 */
+const thumbAttempt = ref<Record<number, number>>({})
+
+function handleThumbError(item: TaskItem) {
+  const used = thumbAttempt.value[item.id] ?? 0
+  if (used + 1 < thumbSources(item).length) {
+    thumbAttempt.value = { ...thumbAttempt.value, [item.id]: used + 1 }
+  }
+  // 候选都失败时不再自增，由 el-image 的 error 插槽显示占位图标
+}
+
+/** 复制任务来源链接（YouTube 原视频/合集链接） */
+async function copySourceLink() {
+  const url = detail.value?.source_url
+  if (!url) {
+    ElMessage.warning('该任务没有来源链接')
+    return
+  }
+  const ok = await copyText(url)
+  if (ok) ElMessage.success('已复制来源链接')
+  else ElMessage.error('复制失败，请手动选中链接复制')
+}
+
+/** 复制某个条目对应的原视频链接 */
+async function copyItemLink(item: TaskItem) {
+  const url = item.url || (item.video_id ? `https://www.youtube.com/watch?v=${item.video_id}` : '')
+  if (!url) {
+    ElMessage.warning('该条目没有原视频链接')
+    return
+  }
+  const ok = await copyText(url)
+  if (ok) ElMessage.success('已复制原视频链接')
+  else ElMessage.error('复制失败，请手动选中链接复制')
 }
 
 onMounted(async () => {
@@ -276,6 +367,16 @@ onMounted(async () => {
                 target="_blank"
                 rel="noopener"
               >{{ shortUrl(detail.source_url, 56) }}</a>
+              <el-button
+                v-if="detail.source_url"
+                link
+                type="primary"
+                size="small"
+                :icon="'CopyDocument'"
+                @click="copySourceLink"
+              >
+                复制链接
+              </el-button>
             </div>
           </div>
         </div>
@@ -342,6 +443,20 @@ onMounted(async () => {
         </el-descriptions>
 
         <el-alert
+          v-if="pendingPublishItems.length"
+          type="warning"
+          :closable="false"
+          show-icon
+          style="margin-top: 12px"
+          title="成片已就绪，等待人工确认发布"
+        >
+          <div>
+            本任务 {{ pendingPublishItems.length }} 个条目尚未发布（默认手动发布，不会自动上传抖音）。
+            在下方条目列表点「立即发布」即可上传；想全自动发布请到「系统配置 → 发布」打开「自动发布」。
+          </div>
+        </el-alert>
+
+        <el-alert
           v-if="detail.status === 'failed' && detail.error"
           type="error"
           :closable="false"
@@ -378,6 +493,32 @@ onMounted(async () => {
                     </el-descriptions-item>
                   </el-descriptions>
                   <div v-else class="muted">暂无处理明细</div>
+
+                  <div v-if="publishHistory(row).length" class="expand-error">
+                    <div class="expand-title">发布记录（最近 {{ publishHistory(row).length }} 次）</div>
+                    <el-timeline class="publish-history">
+                      <el-timeline-item
+                        v-for="(entry, index) in publishHistory(row)"
+                        :key="index"
+                        :type="entry.success ? 'success' : 'danger'"
+                        size="small"
+                        :timestamp="String(entry.at || '').replace('T', ' ')"
+                      >
+                        <span>
+                          {{ entry.kind === 'republish' ? '重新发布' : entry.kind === 'dry_run' ? '干跑自检' : '首次发布' }}
+                          · {{ entry.success ? '成功' : '失败' }}
+                        </span>
+                        <div class="muted history-msg">{{ entry.message }}</div>
+                        <a
+                          v-if="entry.url"
+                          :href="entry.url"
+                          target="_blank"
+                          rel="noopener"
+                          class="pub-link"
+                        >{{ entry.url }}</a>
+                      </el-timeline-item>
+                    </el-timeline>
+                  </div>
 
                   <div v-if="row.error" class="expand-error">
                     <div class="expand-title" style="color: #e05c5c">错误信息</div>
@@ -453,7 +594,12 @@ onMounted(async () => {
                   :class="{ clickable: !!row.output_path }"
                   @click="row.output_path && openPreview(row)"
                 >
-                  <el-image :src="row.thumbnail" fit="cover" class="item-thumb" lazy>
+                  <el-image
+                    :src="thumbSources(row)[thumbAttempt[row.id] ?? 0]"
+                    fit="cover"
+                    class="item-thumb"
+                    @error="handleThumbError(row)"
+                  >
                     <template #error>
                       <div class="thumb-fallback"><el-icon><Picture /></el-icon></div>
                     </template>
@@ -503,7 +649,7 @@ onMounted(async () => {
             </template>
           </el-table-column>
 
-          <el-table-column label="操作" width="190" fixed="right">
+          <el-table-column label="操作" width="280" fixed="right">
             <template #default="{ row }">
               <el-button
                 v-if="row.output_path"
@@ -523,11 +669,36 @@ onMounted(async () => {
                 :loading="publishingId === row.id"
                 @click="handlePublish(row)"
               >
-                手动发布
+                立即发布
+              </el-button>
+              <el-button
+                v-if="
+                  row.output_path &&
+                  ['published', 'failed'].includes(row.publish_status || '') &&
+                  row.publish_status !== 'publishing'
+                "
+                link
+                type="warning"
+                size="small"
+                :icon="'RefreshRight'"
+                :loading="publishingId === row.id"
+                @click="handlePublish(row, true)"
+              >
+                重新发布
               </el-button>
               <a v-if="row.output_path" :href="taskApi.fileUrl(detail.id, row.id, 'output')">
                 <el-button link type="primary" size="small">下载成片</el-button>
               </a>
+              <el-button
+                v-if="row.url || row.video_id"
+                link
+                type="primary"
+                size="small"
+                title="复制该视频的原始链接"
+                @click="copyItemLink(row)"
+              >
+                复制链接
+              </el-button>
               <el-button
                 link
                 size="small"
@@ -747,6 +918,17 @@ onMounted(async () => {
   opacity: 1;
 }
 
+.publish-history {
+  padding-left: 2px;
+  margin-top: 4px;
+}
+
+.history-msg {
+  font-size: 11.5px;
+  margin-top: 2px;
+  word-break: break-all;
+}
+
 .preview-cta {
   display: inline-flex;
   align-items: center;
@@ -771,6 +953,13 @@ onMounted(async () => {
   height: 50px;
   border-radius: 6px;
   flex: none;
+  /* 兜底用的是成片抽帧的竖版封面，contain + 底色保证不把画面主体裁掉 */
+  background: #eef1f6;
+  overflow: hidden;
+}
+
+.item-thumb :deep(img) {
+  object-fit: contain;
 }
 
 .thumb-fallback {

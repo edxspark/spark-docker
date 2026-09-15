@@ -117,7 +117,8 @@ onMounted(async () => {
   height: 32px;
   flex: none;
   border-radius: 9px;
-  background: linear-gradient(135deg, #3b6ef5, #7f5af0);
+  /* 品牌色取自主题变量（src/theme.ts），换主题时自动跟随 */
+  background: linear-gradient(135deg, var(--spark-primary), #6f8fd0);
   display: grid;
   place-items: center;
   font-weight: 700;
@@ -147,7 +148,11 @@ onMounted(async () => {
 }
 
 .app-menu :deep(.el-menu-item.is-active) {
-  background: linear-gradient(90deg, rgba(59, 110, 245, 0.9), rgba(59, 110, 245, 0.35));
+  background: linear-gradient(
+    90deg,
+    rgba(var(--spark-primary-rgb), 0.92),
+    rgba(var(--spark-primary-rgb), 0.34)
+  );
   border-radius: 8px;
   margin: 0 8px;
 }

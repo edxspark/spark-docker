@@ -88,8 +88,14 @@ export const taskApi = {
       .delete<{ message: string }>(`/tasks/${id}`, { params: { remove_files: removeFiles } })
       .then((r) => r.data),
 
-  publishItem: (taskId: number, itemId: number) =>
-    http.post<TaskItem>(`/tasks/${taskId}/items/${itemId}/publish`).then((r) => r.data),
+  /** 发布条目。republish=true 用于「重新发布」已发布过的条目（会再上传一个新作品） */
+  publishItem: (taskId: number, itemId: number, options?: { republish?: boolean; dryRun?: boolean }) =>
+    http
+      .post<TaskItem>(`/tasks/${taskId}/items/${itemId}/publish`, {
+        republish: options?.republish ?? false,
+        dry_run: options?.dryRun ?? false,
+      })
+      .then((r) => r.data),
 
   fileUrl: (taskId: number, itemId: number, kind: string) =>
     `/api/tasks/${taskId}/items/${itemId}/file?kind=${kind}`,

@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { taskApi } from '@/api'
 import type { Task } from '@/types'
+import MetricCard from '@/components/MetricCard.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { STATUS_META, elapsedText, formatDateTime, formatRelative, shortUrl } from '@/utils/format'
 
@@ -49,6 +50,12 @@ const summary = computed(() => {
     videos: list.reduce((sum, r) => sum + (r.total_items || 0), 0),
     doneVideos: list.reduce((sum, r) => sum + (r.done_items || 0), 0),
   }
+})
+
+/** 当前页记录的完成比例（0 表示没有视频，避免除零） */
+const videoRate = computed(() => {
+  const { videos, doneVideos } = summary.value
+  return videos ? `${Math.round((doneVideos / videos) * 100)}%` : '0%'
 })
 
 let timer: number | null = null
@@ -187,22 +194,35 @@ onBeforeUnmount(() => {
     />
 
     <div class="grid-cards stat-grid">
-      <div class="panel stat-card">
-        <div class="stat-value">{{ summary.count }}</div>
-        <div class="stat-label muted">当前页记录</div>
-      </div>
-      <div class="panel stat-card">
-        <div class="stat-value ok">{{ summary.succeeded }}</div>
-        <div class="stat-label muted">成功任务</div>
-      </div>
-      <div class="panel stat-card">
-        <div class="stat-value" :class="{ err: summary.failed > 0 }">{{ summary.failed }}</div>
-        <div class="stat-label muted">失败任务</div>
-      </div>
-      <div class="panel stat-card">
-        <div class="stat-value">{{ summary.doneVideos }}/{{ summary.videos }}</div>
-        <div class="stat-label muted">视频完成数</div>
-      </div>
+      <MetricCard
+        label="当前页记录"
+        :value="summary.count"
+        :hint="`共 ${total} 条历史任务`"
+        icon="Files"
+        color="var(--spark-primary)"
+      />
+      <MetricCard
+        label="成功任务"
+        :value="summary.succeeded"
+        :hint="`当前页 ${summary.count} 条中通过`"
+        icon="CircleCheck"
+        color="#1f8a4c"
+      />
+      <MetricCard
+        label="失败任务"
+        :value="summary.failed"
+        :hint="summary.failed ? '可逐条复跑' : '当前页没有失败记录'"
+        icon="CircleClose"
+        color="#e05c5c"
+        :value-colored="summary.failed > 0"
+      />
+      <MetricCard
+        label="视频完成数"
+        :value="summary.doneVideos"
+        :hint="`共 ${summary.videos} 个视频 · ${videoRate}`"
+        icon="VideoCamera"
+        color="#7f5af0"
+      />
     </div>
 
     <div class="panel">
@@ -311,30 +331,10 @@ onBeforeUnmount(() => {
 
 .stat-grid {
   margin-bottom: 16px;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-}
-
-.stat-card {
-  padding: 16px 18px;
-}
-
-.stat-value {
-  font-size: 24px;
-  font-weight: 650;
-  letter-spacing: -0.5px;
-}
-
-.stat-value.ok {
-  color: #1f8a4c;
-}
-
-.stat-value.err {
-  color: #e05c5c;
-}
-
-.stat-label {
-  font-size: 12.5px;
-  margin-top: 2px;
+  /* 4 张卡：放得下就一行铺满（1440px 下每张 279px），放不下才换行。
+     原先是 repeat(auto-fill, minmax(180px,1fr))——它先切出 6 列再放 4 张卡，
+     空列不回收，于是卡片宽度只有 182px、右侧空掉 393px。 */
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
 }
 
 .cell-sub {

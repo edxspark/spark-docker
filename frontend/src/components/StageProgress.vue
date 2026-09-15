@@ -81,9 +81,9 @@ const done = computed(() => props.status === 'succeeded' || props.status === 'pa
 }
 
 .stage-node.active {
-  background: #e8effe;
+  background: var(--spark-primary-9);
   color: var(--spark-primary);
-  box-shadow: 0 0 0 1px rgba(59, 110, 245, 0.35);
+  box-shadow: 0 0 0 1px rgba(var(--spark-primary-rgb), 0.35);
 }
 
 .dot {

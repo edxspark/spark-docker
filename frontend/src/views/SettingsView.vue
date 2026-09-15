@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { settingsApi } from '@/api'
 import type { RuntimeInfo, SettingsSectionMeta, TestResult, Voice } from '@/types'
@@ -112,11 +113,40 @@ const FIELD_META: Record<string, FieldMeta> = {
     label: '语音识别服务',
     type: 'select',
     options: [
-      { label: '阿里云智能语音交互（真实识别）', value: 'aliyun' },
+      { label: '本地 Whisper（推荐：准确率最高，自带词级时间戳）', value: 'whisper' },
+      { label: '阿里云智能语音交互', value: 'aliyun' },
       { label: 'Mock（离线占位）', value: 'mock' },
     ],
-    help: '凭证与「语音合成」共用同一个阿里云项目 AppKey，无需重复填写',
+    help: '实测同一段英文音频的词准确率：whisper small ≈ 92%，阿里云 ≈ 60%。识别错的内容会被原样翻成错误中文，所以默认用本地 Whisper。首次使用需下载模型（small 约 480MB）',
   },
+  'asr.whisper_model': {
+    label: 'Whisper 模型档位',
+    type: 'select',
+    filterable: true,
+    allowCreate: true,
+    options: [
+      { label: 'base — 最快，准确率一般', value: 'base' },
+      { label: 'small — 推荐，速度与准确率平衡', value: 'small' },
+      { label: 'medium — 更准，CPU 上明显更慢', value: 'medium' },
+      { label: 'large-v3 — 最准，需较强算力', value: 'large-v3' },
+      { label: 'base.en — 纯英文专用，最快', value: 'base.en' },
+      { label: 'small.en — 纯英文专用，推荐', value: 'small.en' },
+      { label: 'medium.en — 纯英文专用', value: 'medium.en' },
+    ],
+    help: '英文视频优先选带 .en 后缀的档位，同样算力下更准',
+  },
+  'asr.whisper_device': {
+    label: '推理设备',
+    type: 'select',
+    options: [
+      { label: 'CPU', value: 'cpu' },
+      { label: 'GPU（CUDA）', value: 'cuda' },
+      { label: '自动', value: 'auto' },
+    ],
+  },
+  'asr.whisper_compute_type': { label: '计算精度', type: 'text', help: 'CPU 上用 int8 最快；有 NVIDIA 显卡可改 float16' },
+  'asr.whisper_max_cue_chars': { label: '识别单条字符上限', type: 'number', min: 20, max: 300, help: '按词级时间戳合并时的字数上限' },
+  'asr.whisper_max_cue_duration': { label: '识别单条时长上限（秒）', type: 'number', min: 1, max: 30, step: 0.5 },
   'asr.enabled': {
     label: '无字幕时自动识别',
     type: 'switch',
@@ -180,8 +210,21 @@ const FIELD_META: Record<string, FieldMeta> = {
     ],
     help: 'Mock 不会打开浏览器，仅生成一条模拟发布记录',
   },
-  'publish.headless': { label: '无头模式', type: 'switch', help: '开启后浏览器不显示窗口。首次调试建议关闭，以便观察页面状态' },
-  'publish.auto_publish': { label: '自动发布', type: 'switch', help: '关闭后流水线只产出成片与文案，需在任务详情页手动确认发布' },
+  'publish.headless': {
+    label: '无头模式（不弹浏览器窗口）',
+    type: 'switch',
+    help: '开启后发布在后台静默完成，不弹出浏览器窗口。实测用已保存的登录态可正常打开上传页；首次扫码登录仍需可见窗口',
+  },
+  'publish.headless_fallback_to_visible': {
+    label: '遇验证码时自动打开窗口',
+    type: 'switch',
+    help: '无头模式更容易触发平台的身份验证/验证码，这类校验必须有可见窗口才能人工完成。开启后命中风控会自动改为有头重试一次，而不是直接失败',
+  },
+  'publish.auto_publish': {
+    label: '自动发布',
+    type: 'switch',
+    help: '默认关闭 = 手动发布：流水线只产出成片与文案，条目停在「待发布」，需在任务详情页点「立即发布」确认上传。开启后任务跑完会自动上传抖音',
+  },
   'publish.title_max_len': { label: '标题最大长度', type: 'number', min: 1, max: 200, help: '抖音标题上限为 30 字，超出会被截断' },
   'publish.default_tags': { label: '默认话题标签', type: 'tags', help: '生成标题与话题失败时的兜底标签，不带 # 号' },
   'publish.schedule_offset_minutes': { label: '定时发布延迟（分钟）', type: 'number', min: 0, max: 20160, help: '0 表示立即发布；大于 0 表示处理完成后延迟 N 分钟以定时方式发布' },
@@ -216,7 +259,22 @@ const FIELD_META: Record<string, FieldMeta> = {
     type: 'number',
     min: 6,
     max: 120,
-    help: '以 1080p 画面为基准的像素值，会按成片分辨率等比缩放：1080p 成片即该值本身，1080x1920 竖屏约为其 1.78 倍',
+    help: '以 1080p 画面为基准的像素值，按成片分辨率等比缩放。行业规范建议字高约占画面高度 4.5%（1080p 约 48px）；改完可用 scripts/preview_subtitles.py 几秒出对照图，无需重渲染',
+  },
+  'video.subtitle_max_duration': {
+    label: '单条字幕最长停留（秒）',
+    type: 'number',
+    min: 1,
+    max: 30,
+    step: 0.5,
+    help: '超过就按自然边界切分。设太大会出现「一句话占屏十几秒」，观感就是字幕与话音对不上；行业惯例单条 1~7 秒，常见 2~4 秒',
+  },
+  'video.subtitle_max_chars': {
+    label: '单条字幕最长字符数',
+    type: 'number',
+    min: 20,
+    max: 300,
+    help: '中英双语时按主字幕（中文）计。行业惯例单条最多 2 行、每行约 42 字符',
   },
   'video.subtitle_font_name': { label: '字幕字体', type: 'text', help: '留空自动选择系统中可用的中文字体。注意 macOS 的 PingFang SC 无法被 libass 加载，填写后可能触发字体回退' },
   'video.subtitle_margin_v': {
@@ -260,6 +318,7 @@ const FIELD_META: Record<string, FieldMeta> = {
   },
 }
 
+const route = useRoute()
 const loading = ref(true)
 const saving = ref(false)
 const testing = ref<string | null>(null)
@@ -337,7 +396,11 @@ async function load() {
       form[section.key] = target
     }
     pristine.value = JSON.parse(JSON.stringify(form))
-    if (!sections.value.some((s) => s.key === activeTab.value)) {
+    // 支持 /settings?section=publish 直接落到指定分组（其它页面会这样跳过来）
+    const wanted = String(route.query.section || '')
+    if (wanted && sections.value.some((s) => s.key === wanted)) {
+      activeTab.value = wanted
+    } else if (!sections.value.some((s) => s.key === activeTab.value)) {
       activeTab.value = sections.value[0]?.key || 'general'
     }
   } catch {

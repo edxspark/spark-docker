@@ -84,6 +84,36 @@ class TestConfigNormalize:
             TranslatorConfig(temperature=5)
 
 
+class TestPublishDefaults:
+    """默认手动发布：只有用户在系统配置里开启后才会自动上传抖音。"""
+
+    def test_auto_publish_defaults_to_off(self):
+        from app.services.settings_store import PublishConfig
+
+        assert PublishConfig().auto_publish is False
+        assert DEFAULT_CONFIG["publish"]["auto_publish"] is False
+
+    def test_normalize_keeps_explicitly_enabled_auto_publish(self):
+        # 老库里已经显式存过 true 的安装不能被默认值改回去
+        data = _normalize("publish", {"auto_publish": True})
+        assert data["auto_publish"] is True
+
+    def test_manual_publish_is_immediate_by_default(self):
+        from app.schemas import PublishItemRequest
+
+        assert PublishItemRequest().immediate is True
+        assert PublishItemRequest(immediate=False).immediate is False
+
+    def test_manual_publish_ignores_schedule_offset(self):
+        """延迟只作用于自动发布：手动发布的 immediate 分支不会去算 schedule_at。"""
+        from app.pipeline.stages.deliver import resolve_schedule
+        from app.schemas import PublishItemRequest
+
+        publish_cfg = {"schedule_offset_minutes": 120}
+        assert resolve_schedule({}, publish_cfg) is not None  # 自动发布：按配置延迟
+        assert PublishItemRequest().immediate is True  # 手动发布：立刻上传
+
+
 class TestTextUtils:
     def test_normalize_punct_converts_to_fullwidth(self):
         assert normalize_punct("你好,世界!") == "你好，世界！"

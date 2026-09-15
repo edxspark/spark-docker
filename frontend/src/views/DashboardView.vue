@@ -5,8 +5,10 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import * as echarts from 'echarts'
 import { settingsApi, statsApi, taskApi } from '@/api'
 import type { RuntimeInfo, StatsOverview, Task } from '@/types'
+import MetricCard from '@/components/MetricCard.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import {
+  cssVar,
   formatDateTime,
   formatNumber,
   formatRelative,
@@ -43,7 +45,7 @@ const cards = computed(() => {
       value: formatNumber(data?.total_tasks),
       hint: `执行中 ${data?.running_tasks ?? 0}`,
       icon: 'Files',
-      color: '#3b6ef5',
+      color: 'var(--spark-primary)',
     },
     {
       key: 'succeeded',
@@ -122,6 +124,10 @@ function renderChart() {
   if (!chart) {
     chart = echarts.init(chartEl.value)
   }
+  // ECharts 画的是 canvas，无法解析 CSS 变量（实测 var() 会被画成黑色），
+  // 必须先把主题色解析成真实色值再交给它。
+  const primary = cssVar('--spark-primary', '#325AB4')
+  const primaryRgb = cssVar('--spark-primary-rgb', '50, 90, 180')
   chart.setOption({
     grid: { left: 40, right: 18, top: 32, bottom: 28 },
     tooltip: { trigger: 'axis' },
@@ -145,8 +151,8 @@ function renderChart() {
         smooth: true,
         symbolSize: 6,
         data: daily.map((d) => d.created),
-        itemStyle: { color: '#3b6ef5' },
-        areaStyle: { color: 'rgba(59,110,245,0.10)' },
+        itemStyle: { color: primary },
+        areaStyle: { color: `rgba(${primaryRgb}, 0.10)` },
       },
       {
         name: '成功',
@@ -347,16 +353,15 @@ onBeforeUnmount(() => {
 
     <!-- 指标卡 -->
     <div class="grid-cards metric-grid">
-      <div v-for="card in cards" :key="card.key" class="panel metric-card">
-        <div class="metric-icon" :style="{ background: `${card.color}1a`, color: card.color }">
-          <el-icon :size="18"><component :is="card.icon" /></el-icon>
-        </div>
-        <div class="metric-body">
-          <div class="metric-label">{{ card.label }}</div>
-          <div class="metric-value">{{ card.value }}</div>
-          <div class="metric-hint muted">{{ card.hint }}</div>
-        </div>
-      </div>
+      <MetricCard
+        v-for="card in cards"
+        :key="card.key"
+        :label="card.label"
+        :value="card.value"
+        :hint="card.hint"
+        :icon="card.icon"
+        :color="card.color"
+      />
     </div>
 
     <div class="two-col">
@@ -478,56 +483,7 @@ onBeforeUnmount(() => {
   grid-template-columns: repeat(auto-fit, minmax(182px, 1fr));
 }
 
-.metric-card {
-  /* 图标在左、文案在右（水平对齐），图标垂直居中于三行文案 */
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 14px 16px;
-  /* 高度交给网格行（同一行等高），文案再长也不会单独长高 */
-}
-
-.metric-icon {
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
-  display: grid;
-  place-items: center;
-  flex: none;
-}
-
-.metric-body {
-  /* 窄列里允许收缩；配合下面三行的 nowrap+ellipsis 保证不换行 */
-  min-width: 0;
-  flex: 1;
-}
-
-.metric-label {
-  font-size: 12.5px;
-  line-height: 1.35;
-  color: var(--spark-text-2);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.metric-value {
-  font-size: 21px;
-  font-weight: 650;
-  line-height: 1.3;
-  letter-spacing: -0.5px;
-  /* 大数（如 1,234,567）不换行，保持一行高度一致 */
-  white-space: nowrap;
-}
-
-.metric-hint {
-  font-size: 11.5px;
-  line-height: 1.35;
-  /* 提示文案固定一行：过长省略，卡片高度不受文案长度影响 */
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+/* 卡片外观由 @/components/MetricCard.vue 统一提供（与任务历史页共用） */
 
 .two-col {
   display: grid;

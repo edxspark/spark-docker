@@ -231,24 +231,21 @@ async def test_pipeline_is_resumable(prepared):
     assert prepared.download_calls == calls_after_first_run, "续跑时不应重复下载"
 
 
-async def test_publish_can_be_skipped(prepared):
-    """关闭自动发布时，成片产出但发布被跳过。"""
+async def test_publish_is_pending_by_default(prepared):
+    """未显式开启自动发布时，成片产出但停在「待发布」，等人工确认。"""
     if not (await _ffmpeg_ok()):
         pytest.skip("未安装 ffmpeg")
 
+    # prepared 里的配置显式开了自动发布，这里覆盖回关闭状态（= 系统默认）
+    async with SessionLocal() as session:
+        await settings_store.update(session, {"publish": {"auto_publish": False}})
 
     task_id = await _create_task("https://www.youtube.com/watch?v=skip0001")
-    async with SessionLocal() as session:
-        task = await session.get(Task, task_id)
-        assert task is not None
-        task.options = {"auto_publish": False}
-        await session.commit()
-
     await _run_to_completion(task_id)
     task, items, _ = await _load(task_id)
     assert task.status == TaskStatus.SUCCEEDED.value
     assert items[0].output_path
-    assert items[0].publish_status == "skipped"
+    assert items[0].publish_status == "pending"
     assert items[0].publish_url == ""
 
 

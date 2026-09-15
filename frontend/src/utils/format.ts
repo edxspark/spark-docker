@@ -10,9 +10,12 @@ export const STATUS_META: Record<string, { label: string; type: 'info' | 'primar
 
 export const PUBLISH_META: Record<string, { label: string; type: string }> = {
   '': { label: '未发布', type: 'info' },
+  // 默认手动发布：流水线跑完就停在这个状态，等人在任务详情页确认上传
+  pending: { label: '待发布', type: 'warning' },
   publishing: { label: '发布中', type: 'primary' },
   published: { label: '已发布', type: 'success' },
   failed: { label: '发布失败', type: 'danger' },
+  // 历史数据里可能仍留有「已跳过」，保留映射避免显示原始英文
   skipped: { label: '已跳过', type: 'info' },
 }
 
@@ -29,6 +32,16 @@ export const STAGE_LABELS: Record<string, string> = {
 
 export function statusLabel(status: string): string {
   return STATUS_META[status]?.label || status || '-'
+}
+
+/**
+ * 读取主题 CSS 变量的真实值。
+ * 用于 canvas 绘制（ECharts 等）：canvas 不认 `var(--x)`，必须传解析后的色值。
+ */
+export function cssVar(name: string, fallback = ''): string {
+  if (typeof window === 'undefined') return fallback
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+  return value || fallback
 }
 
 export function formatDuration(seconds: number): string {
@@ -89,4 +102,41 @@ export function elapsedText(start?: string | null, end?: string | null): string 
 export function shortUrl(url: string, max = 52): string {
   if (!url) return '-'
   return url.length > max ? `${url.slice(0, max - 1)}…` : url
+}
+
+/**
+ * 复制文本到剪贴板。
+ *
+ * 优先用 navigator.clipboard；它只在安全上下文可用（localhost 或 https），
+ * 局域网 IP 访问开发环境时会直接抛错，因此回退到 textarea + execCommand。
+ */
+export async function copyText(text: string): Promise<boolean> {
+  const value = (text || '').trim()
+  if (!value) return false
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value)
+      return true
+    } catch {
+      /* 继续走回退方案 */
+    }
+  }
+
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = value
+    textarea.setAttribute('readonly', '')
+    // 放在视口外，避免复制时页面抖动
+    textarea.style.position = 'fixed'
+    textarea.style.top = '-1000px'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(textarea)
+    return ok
+  } catch {
+    return false
+  }
 }

@@ -4,7 +4,12 @@
   --spark-border: #e4e7ed;
   --spark-text: #1f2329;
   --spark-text-2: #646a73;
-  --spark-primary: #3b6ef5;
+  /* 主题色兜底值：实际值由 src/theme.ts 在运行时注入（见 main.ts），
+     这里保留一份，保证样式表单独加载时也有正确颜色 */
+  --spark-primary: #325ab4;
+  --spark-primary-rgb: 50, 90, 180;
+  --spark-primary-8: #d6deef;
+  --spark-primary-9: #eaedf7;
   --spark-radius: 10px;
   --spark-shadow: 0 1px 3px rgba(15, 23, 42, 0.06), 0 8px 24px -12px rgba(15, 23, 42, 0.12);
 }

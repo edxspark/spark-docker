@@ -6,7 +6,7 @@ import { taskApi } from '@/api'
 import type { Task } from '@/types'
 import StatusTag from '@/components/StatusTag.vue'
 import StageProgress from '@/components/StageProgress.vue'
-import { STATUS_META, elapsedText, formatDateTime, formatRelative, shortUrl } from '@/utils/format'
+import { STATUS_META, copyText, elapsedText, formatDateTime, formatRelative, shortUrl } from '@/utils/format'
 
 const router = useRouter()
 
@@ -82,6 +82,17 @@ function open(row: Task) {
 /** 跳到详情页并自动打开第一个成片（列表页拿不到条目 id，交给详情页处理） */
 function preview(row: Task) {
   router.push(`/tasks/${row.id}?preview=1`)
+}
+
+/** 复制任务的原始视频链接（YouTube 来源链接） */
+async function copySourceLink(row: Task) {
+  if (!row.source_url) {
+    ElMessage.warning('该任务没有来源链接')
+    return
+  }
+  const ok = await copyText(row.source_url)
+  if (ok) ElMessage.success('已复制来源链接')
+  else ElMessage.error('复制失败，请手动选中链接复制')
 }
 
 async function cancel(row: Task) {
@@ -272,7 +283,20 @@ onBeforeUnmount(() => {
         <el-table-column label="任务" min-width="300">
           <template #default="{ row }">
             <div class="cell-title">{{ row.title || '未命名任务' }}</div>
-            <div class="muted mono cell-sub">{{ shortUrl(row.source_url, 66) }}</div>
+            <div class="cell-src">
+              <span class="muted mono cell-sub">{{ shortUrl(row.source_url, 66) }}</span>
+              <el-button
+                v-if="row.source_url"
+                link
+                type="primary"
+                size="small"
+                :icon="'CopyDocument'"
+                title="复制来源链接"
+                @click.stop="copySourceLink(row)"
+              >
+                复制链接
+              </el-button>
+            </div>
           </template>
         </el-table-column>
 
@@ -328,7 +352,7 @@ onBeforeUnmount(() => {
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="230" fixed="right">
+        <el-table-column label="操作" width="260" fixed="right">
           <template #default="{ row }">
             <el-button
               v-if="row.done_items > 0"
@@ -358,6 +382,15 @@ onBeforeUnmount(() => {
               @click.stop="retry(row)"
             >
               重试
+            </el-button>
+            <el-button
+              v-if="row.source_url"
+              link
+              type="primary"
+              size="small"
+              @click.stop="copySourceLink(row)"
+            >
+              复制链接
             </el-button>
             <el-button link type="danger" size="small" @click.stop="remove(row)">删除</el-button>
           </template>
@@ -410,6 +443,20 @@ onBeforeUnmount(() => {
 .cell-sub {
   font-size: 11.5px;
   margin-top: 2px;
+}
+
+.cell-src {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.cell-src .cell-sub {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ellipsis {
