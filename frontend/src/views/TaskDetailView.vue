@@ -7,6 +7,7 @@ import { useTaskSocket } from '@/composables/useTaskSocket'
 import type { TaskItem } from '@/types'
 import StatusTag from '@/components/StatusTag.vue'
 import StageProgress from '@/components/StageProgress.vue'
+import VideoPreviewDialog from '@/components/VideoPreviewDialog.vue'
 import {
   STAGE_LABELS,
   elapsedText,
@@ -30,6 +31,8 @@ const autoScroll = ref(true)
 const logBox = ref<HTMLDivElement | null>(null)
 const expanded = ref<number[]>([])
 const publishingId = ref<number | null>(null)
+const previewOpen = ref(false)
+const previewItem = ref<TaskItem | null>(null)
 
 const { detail, logs, connected, reload } = useTaskSocket(taskId, {
   onUpdate: (event) => {
@@ -206,6 +209,15 @@ async function handleDelete() {
   }
 }
 
+function openPreview(item: TaskItem) {
+  if (!item.output_path) {
+    ElMessage.warning('该条目还没有成片')
+    return
+  }
+  previewItem.value = item
+  previewOpen.value = true
+}
+
 async function handlePublish(item: TaskItem) {
   if (!taskId.value) return
   publishingId.value = item.id
@@ -229,6 +241,12 @@ onMounted(async () => {
     await reload()
   } catch {
     notFound.value = true
+    return
+  }
+  // 从列表页「看成片」跳转过来时自动打开预览
+  if (route.query.preview) {
+    const first = detail.value?.items.find((item) => item.output_path)
+    if (first) openPreview(first)
   }
 })
 </script>
@@ -368,6 +386,10 @@ onMounted(async () => {
                 </div>
 
                 <div class="expand-col">
+                  <button v-if="row.output_path" class="preview-cta" @click="openPreview(row)">
+                    <el-icon><VideoPlay /></el-icon> 查看成片视频
+                  </button>
+
                   <div class="expand-title">产物下载</div>
                   <div class="artifacts">
                     <a
@@ -426,14 +448,18 @@ onMounted(async () => {
           <el-table-column label="视频" min-width="320">
             <template #default="{ row }">
               <div class="item-row">
-                <el-image :src="row.thumbnail" fit="cover" class="item-thumb" lazy
-                  :preview-src-list="row.thumbnail ? [row.thumbnail] : []"
-                  preview-teleported
+                <div
+                  class="thumb-box"
+                  :class="{ clickable: !!row.output_path }"
+                  @click="row.output_path && openPreview(row)"
                 >
-                  <template #error>
-                    <div class="thumb-fallback"><el-icon><Picture /></el-icon></div>
-                  </template>
-                </el-image>
+                  <el-image :src="row.thumbnail" fit="cover" class="item-thumb" lazy>
+                    <template #error>
+                      <div class="thumb-fallback"><el-icon><Picture /></el-icon></div>
+                    </template>
+                  </el-image>
+                  <div v-if="row.output_path" class="thumb-play"><el-icon><VideoPlay /></el-icon></div>
+                </div>
                 <div class="item-text">
                   <div class="item-title">{{ row.title_zh || row.title || row.video_id }}</div>
                   <div v-if="row.title_zh" class="muted item-sub">{{ truncateLog(row.title, 70) }}</div>
@@ -480,6 +506,16 @@ onMounted(async () => {
           <el-table-column label="操作" width="190" fixed="right">
             <template #default="{ row }">
               <el-button
+                v-if="row.output_path"
+                link
+                type="success"
+                size="small"
+                :icon="'VideoPlay'"
+                @click="openPreview(row)"
+              >
+                查看成片
+              </el-button>
+              <el-button
                 v-if="row.output_path && row.publish_status !== 'published' && row.publish_status !== 'publishing'"
                 link
                 type="primary"
@@ -503,6 +539,8 @@ onMounted(async () => {
           </el-table-column>
         </el-table>
       </div>
+
+      <VideoPreviewDialog v-model="previewOpen" :task-id="taskId" :item="previewItem" />
 
       <!-- 日志 -->
       <div class="panel">
@@ -679,6 +717,53 @@ onMounted(async () => {
   display: flex;
   gap: 12px;
   align-items: flex-start;
+}
+
+.thumb-box {
+  position: relative;
+  flex: none;
+  border-radius: 6px;
+  overflow: hidden;
+  line-height: 0;
+}
+
+.thumb-box.clickable {
+  cursor: pointer;
+}
+
+.thumb-play {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-size: 22px;
+  background: rgba(0, 0, 0, 0.32);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.thumb-box.clickable:hover .thumb-play {
+  opacity: 1;
+}
+
+.preview-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 14px;
+  padding: 8px 14px;
+  font-size: 13px;
+  color: #fff;
+  background: linear-gradient(135deg, #1f8a4c, #2fae66);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.preview-cta:hover {
+  filter: brightness(1.06);
 }
 
 .item-thumb {

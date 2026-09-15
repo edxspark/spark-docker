@@ -249,8 +249,18 @@ onBeforeUnmount(() => {
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="150" fixed="right">
+        <el-table-column label="操作" width="190" fixed="right">
           <template #default="{ row }">
+            <el-button
+              v-if="row.done_items > 0"
+              link
+              type="success"
+              size="small"
+              :icon="'VideoPlay'"
+              @click="router.push(`/tasks/${row.id}?preview=1`)"
+            >
+              看成片
+            </el-button>
             <el-button link type="primary" size="small" @click="router.push(`/tasks/${row.id}`)">
               详情
             </el-button>

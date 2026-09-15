@@ -507,9 +507,17 @@ async def download_item_file(
     task_id: int,
     item_id: int,
     kind: str = Query(default="output", pattern="^(output|cover|subtitle_zh|subtitle_source|video|audio)$"),
+    inline: bool = Query(
+        default=False,
+        description="true 时以 inline 方式返回，供页面内嵌播放；false 则作为附件下载",
+    ),
     session: AsyncSession = Depends(get_session),
 ) -> FileResponse:
-    """下载条目产物（成片/封面/字幕等）。"""
+    """获取条目产物（成片/封面/字幕等）。
+
+    Starlette 的 FileResponse 原生支持 Range 请求，因此 <video> 可以正常拖动进度条，
+    大文件也不会被整体读进内存。
+    """
     item = await session.get(TaskItem, item_id)
     if item is None or item.task_id != task_id:
         raise HTTPException(status_code=404, detail="条目不存在")
@@ -530,7 +538,11 @@ async def download_item_file(
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"文件已被清理：{path.name}")
 
-    return FileResponse(path, filename=path.name)
+    return FileResponse(
+        path,
+        filename=path.name,
+        content_disposition_type="inline" if inline else "attachment",
+    )
 
 
 @router.websocket("/{task_id}/ws")

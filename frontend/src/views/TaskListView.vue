@@ -79,6 +79,11 @@ function open(row: Task) {
   router.push(`/tasks/${row.id}`)
 }
 
+/** 跳到详情页并自动打开第一个成片（列表页拿不到条目 id，交给详情页处理） */
+function preview(row: Task) {
+  router.push(`/tasks/${row.id}?preview=1`)
+}
+
 async function cancel(row: Task) {
   try {
     const result = await taskApi.cancel(row.id)
@@ -300,8 +305,13 @@ onBeforeUnmount(() => {
           </template>
         </el-table-column>
 
-        <el-table-column label="状态" width="106">
-          <template #default="{ row }"><StatusTag :status="row.status" /></template>
+        <el-table-column label="状态" width="120">
+          <template #default="{ row }">
+            <StatusTag :status="row.status" />
+            <div v-if="row.done_items > 0" class="muted cell-sub">
+              {{ row.done_items }} 个成片可看
+            </div>
+          </template>
         </el-table-column>
 
         <el-table-column label="耗时" width="110">
@@ -318,8 +328,18 @@ onBeforeUnmount(() => {
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="196" fixed="right">
+        <el-table-column label="操作" width="230" fixed="right">
           <template #default="{ row }">
+            <el-button
+              v-if="row.done_items > 0"
+              link
+              type="success"
+              size="small"
+              :icon="'VideoPlay'"
+              @click.stop="preview(row)"
+            >
+              看成片
+            </el-button>
             <el-button link type="primary" size="small" @click.stop="open(row)">详情</el-button>
             <el-button
               v-if="row.status === 'pending' || row.status === 'running'"
