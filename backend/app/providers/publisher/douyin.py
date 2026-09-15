@@ -38,6 +38,10 @@ PUBLISH_URL_PATTERNS = (
 
 # 每个语义操作给多个候选选择器，按顺序尝试，任一命中即可（平台改版时只需改这里）
 UPLOAD_INPUT_SELECTORS = (
+    # 实测 2026-09 的页面：
+    #   <input type="file" accept="video/x-flv,video/mp4,...,video/*,...">，无 class/id，尺寸 1x1
+    'input[type="file"][accept*="video"]',
+    'input[accept*="video"]',
     "input.upload-btn-input",
     "div[class^='container'] input[accept]",
     "div[class^='container'] input[type='file']",
@@ -121,18 +125,30 @@ def _require_playwright():
     return async_playwright
 
 
-async def _first_visible(page, selectors: tuple[str, ...], *, timeout: float = 3000):
-    """按候选顺序返回第一个匹配到的 locator。"""
-    per_selector = max(0.4, timeout / 1000 / max(1, len(selectors)))
-    for selector in selectors:
-        locator = page.locator(selector).first
-        try:
-            if await locator.count() == 0:
+async def _first_visible(page, selectors: tuple[str, ...], *, timeout: float = 3000, state: str = "visible"):
+    """按候选顺序轮询，返回第一个命中且达到指定状态的 locator。
+
+    必须在整个 timeout 内反复轮询，而不是「扫一遍没命中就放弃」——
+    创作者中心是 SPA，上传控件要几秒才渲染出来。实测页面加载后 2 秒时
+    `input[type=file]` 还不存在；一次性检查会让所有候选瞬间落空，
+    最终误报「未找到上传入口，页面结构可能已改版」。
+
+    state 默认 visible；文件输入框常被样式隐藏（实测尺寸仅 1x1），
+    这类元素应传 state="attached"——set_input_files 对隐藏输入同样有效。
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.5, timeout / 1000)
+    while loop.time() < deadline:
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() == 0:
+                    continue
+                await locator.wait_for(state=state, timeout=1500)
+                return locator
+            except Exception:  # noqa: BLE001 - 逐个候选试错
                 continue
-            await locator.wait_for(state="visible", timeout=per_selector * 1000)
-            return locator
-        except Exception:  # noqa: BLE001 - 逐个候选试错
-            continue
+        await asyncio.sleep(0.4)
     return None
 
 
@@ -353,9 +369,26 @@ class DouyinPublisher(BasePublisher):
                     )
 
                 # 1) 选择文件并等待跳转到发布页
-                upload_input = await _first_visible(page, UPLOAD_INPUT_SELECTORS, timeout=60000)
+                # 文件输入框在页面上是 1x1 的隐藏元素，用 attached 而非 visible
+                upload_input = await _first_visible(
+                    page, UPLOAD_INPUT_SELECTORS, timeout=60000, state="attached"
+                )
                 if upload_input is None:
-                    raise ProviderError("未找到上传入口，抖音创作者中心页面结构可能已改版")
+                    # 附上当期页面的实际 input 情况，避免下次只能靠猜
+                    try:
+                        probe = await page.evaluate(
+                            """() => Array.from(document.querySelectorAll('input')).map(el => ({
+                                type: el.type, accept: (el.accept || '').slice(0, 40),
+                                cls: String(el.className || '').slice(0, 60),
+                            }))"""
+                        )
+                    except Exception:  # noqa: BLE001
+                        probe = "（无法读取页面信息）"
+                    raise ProviderError(
+                        f"未找到上传入口。当前页面 URL={page.url}，"
+                        f"页面上的 input 元素={probe}。"
+                        "若确实已改版，请更新 douyin.py 顶部的 UPLOAD_INPUT_SELECTORS"
+                    )
                 await upload_input.set_input_files(str(video_path))
                 await self._wait_publish_page(page, timeout_ms)
 
@@ -454,7 +487,9 @@ class DouyinPublisher(BasePublisher):
             if await _exists(page, UPLOAD_FAILED_SELECTORS):
                 # 重试一次：重新选择文件
                 logger.warning("检测到上传失败，尝试重新上传")
-                upload_input = await _first_visible(page, UPLOAD_INPUT_SELECTORS, timeout=10000)
+                upload_input = await _first_visible(
+                    page, UPLOAD_INPUT_SELECTORS, timeout=10000, state="attached"
+                )
                 if upload_input is None:
                     raise ProviderError("视频上传失败，且未找到重试入口")
                 await upload_input.set_input_files(str(video_path))
