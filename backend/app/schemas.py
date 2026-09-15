@@ -92,6 +92,7 @@ class TaskItemOut(BaseModel):
     dubbed_audio_path: str
     output_path: str
     cover_path: str
+    cover_landscape_path: str = ""
     publish_status: str
     publish_url: str
     publish_error: str

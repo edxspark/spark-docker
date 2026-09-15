@@ -150,6 +150,8 @@ class PublishRequest:
     title: str
     tags: list[str] = field(default_factory=list)
     cover_path: Path | None = None
+    # 横封面（抖音 4:3）。平台对竖/横两种封面分别取图，只传一个会缺一边。
+    cover_landscape_path: Path | None = None
     description: str = ""
     schedule_at: str | None = None        # "YYYY-MM-DD HH:MM"
     headless: bool = False

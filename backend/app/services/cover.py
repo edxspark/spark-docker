@@ -549,6 +549,10 @@ def generate_cover(
     return out_path
 
 
+# 抖音的横封面固定为 4:3（弹窗里显示「横封面预览（4:3）」）
+LANDSCAPE_COVER_SIZE = (1440, 1080)
+
+
 def cover_size_for(aspect: str, source_width: int = 0, source_height: int = 0) -> tuple[int, int]:
     """按成片比例给出封面尺寸。抖音封面以竖版 9:16 最通用。"""
     if aspect == "16:9":

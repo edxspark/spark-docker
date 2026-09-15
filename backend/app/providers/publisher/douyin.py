@@ -858,24 +858,42 @@ class DouyinPublisher(BasePublisher):
             logger.error("封面弹窗里没有找到上传入口，本地封面未能上传，将退回平台推荐封面（视频帧）")
             return await self._use_recommended_cover(page)
 
-        # 3) 优先设置竖版封面（抖音推荐竖屏），弹窗默认就在该页
-        try:
-            portrait_tab = modal.get_by_text("设置竖封面", exact=True).first
-            if await portrait_tab.count():
-                await portrait_tab.click(timeout=3000)
-                await page.wait_for_timeout(600)
-        except Exception:  # noqa: BLE001 - 已在目标页时点击会失败，忽略
-            pass
+        # 3) 依次设置竖封面与横封面。
+        #    抖音对两种封面分开取图：弹窗里是「设置竖封面」「设置横封面」两个页签，
+        #    且实测文本明确写着「横封面预览（4:3）」。只设竖封面会让横版位空着。
+        landscape = Path(request.cover_landscape_path) if request.cover_landscape_path else None
+        if landscape is not None and not landscape.exists():
+            logger.warning("横封面文件不存在：%s —— 本次只设置竖封面", landscape)
+            landscape = None
 
-        # 记录上传前的封面预览状态，用于确认这次确实换掉了
-        before_src = await self._cover_preview_src(page)
-        await upload.set_input_files(str(cover))
-        await page.wait_for_timeout(3000)
-        after_src = await self._cover_preview_src(page)
-        logger.info(
-            "封面已提交到上传框：预览图 %s",
-            "已更新" if (after_src and after_src != before_src) else "未检测到变化（继续等待处理）",
-        )
+        plan: list[tuple[str, Path]] = [("设置竖封面", cover)]
+        if landscape is not None:
+            plan.append(("设置横封面", landscape))
+
+        for tab_text, path in plan:
+            try:
+                tab = modal.get_by_text(tab_text, exact=True).first
+                if await tab.count():
+                    await tab.click(timeout=3000)
+                    await page.wait_for_timeout(800)
+            except Exception:  # noqa: BLE001 - 已在目标页时点击会失败，忽略
+                pass
+            before = await self._cover_preview_src(page)
+            await upload.set_input_files(str(path))
+            await page.wait_for_timeout(3000)
+            after = await self._cover_preview_src(page)
+            logger.info(
+                "%s：已上传 %s（预览%s）",
+                tab_text,
+                path.name,
+                "已更新" if (after and after != before) else "未检测到变化，继续等待处理",
+            )
+
+        if landscape is None:
+            logger.warning(
+                "本次只上传了竖封面，抖音的横封面位（4:3）将保持为空；"
+                "如需补齐请确认成片已生成横封面文件"
+            )
 
         # 4) 等「完成」解禁：图片处理完之前它是 disabled，点了无效
         done = modal.get_by_role("button", name="完成", exact=True).first
@@ -906,7 +924,7 @@ class DouyinPublisher(BasePublisher):
         if still_open:
             logger.warning("封面弹窗未能关闭，尝试用 Esc 收起")
             await _dismiss_overlays(page)
-        logger.info("自定义封面上传完成：%s", cover.name)
+        logger.info("自定义封面上传完成：竖封面%s", "、横封面" if landscape is not None else "（未含横封面）")
         return True
 
     async def _cover_preview_src(self, page) -> str:

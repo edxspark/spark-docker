@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from PIL import Image
 
@@ -405,3 +407,84 @@ class TestThumbnailCover:
             assert pixels[540, 1080 - 300] is not None  # 仅确认可读，细节由视觉验证
             bright = sum(1 for y in range(0, 1920, 4) for x in range(0, 1080, 4) if pixels[x, y] > 200)
         assert bright > 200, "原图四角的标记没有保留，说明被裁切了"
+
+
+class TestLandscapeCover:
+    """抖音的竖封面与横封面分开取图，横封面固定 4:3。
+
+    事故：只设置了竖封面，横版位始终为空。实地检查封面弹窗，文本里明确写着
+    「横封面预览（4:3）」，且主表单上有两个封面位（160x147 与 160x120，
+    后者比例 1.33 正是 4:3）。
+    """
+
+    def test_landscape_size_is_4_3(self):
+        from app.services.cover import LANDSCAPE_COVER_SIZE
+
+        width, height = LANDSCAPE_COVER_SIZE
+        assert abs(width / height - 4 / 3) < 0.01, f"{width}x{height} 不是 4:3"
+        assert width >= 1080, "分辨率过低，横封面会糊"
+
+    def test_publish_request_carries_both_covers(self):
+        from app.providers.base import PublishRequest
+
+        request = PublishRequest(video_path=Path("/tmp/x.mp4"), title="t")
+        assert request.cover_path is None
+        assert request.cover_landscape_path is None, "必须支持单独传横封面"
+
+    def test_both_tabs_are_used(self):
+        """实现里必须同时点「设置竖封面」与「设置横封面」两个页签。"""
+        import inspect
+
+        from app.providers.publisher.douyin import DouyinPublisher
+
+        source = inspect.getsource(DouyinPublisher._set_cover)
+        assert "设置竖封面" in source and "设置横封面" in source, "缺少横封面的上传步骤"
+
+    def test_warns_when_landscape_missing(self):
+        import inspect
+
+        from app.providers.publisher.douyin import DouyinPublisher
+
+        source = inspect.getsource(DouyinPublisher._set_cover)
+        assert "横封面位（4:3）将保持为空" in source, "缺横封面时必须明确告知用户"
+
+    def test_landscape_cover_content_matches_source(self, tmp_path):
+        """横封面同样是缩略图内容，只是按 4:3 重新构图。"""
+        import io
+
+        from PIL import Image
+
+        from app.services.cover import LANDSCAPE_COVER_SIZE, CoverStyle, build_thumbnail_cover
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (1280, 720), (30, 90, 180)).save(buffer, "JPEG")
+        out = tmp_path / "landscape.jpg"
+        build_thumbnail_cover(buffer.getvalue(),
+                              CoverStyle(width=LANDSCAPE_COVER_SIZE[0], height=LANDSCAPE_COVER_SIZE[1]),
+                              out)
+        with Image.open(out) as im:
+            assert im.size == LANDSCAPE_COVER_SIZE
+            assert abs(im.size[0] / im.size[1] - 4 / 3) < 0.01
+
+    def test_item_model_has_landscape_field(self):
+        from app.models import TaskItem
+
+        assert "cover_landscape_path" in TaskItem.__table__.columns
+
+    async def test_migration_adds_column_to_existing_db(self, tmp_root):
+        """已有数据库需要补列——create_all 不会改动已存在的表。"""
+        import sqlite3
+
+        from app.db import init_db
+
+        await init_db()
+        from app.core.config import settings
+
+        # 数据库位置由 SPARK_DATABASE_URL 决定，不能假设是 data_dir/spark.db
+        url = settings.resolved_database_url()
+        db_path = url.split("///")[-1]
+        con = sqlite3.connect(db_path)
+        columns = {row[1] for row in con.execute("PRAGMA table_info(task_items)")}
+        con.close()
+        assert columns, f"读不到 task_items 表（数据库：{db_path}）"
+        assert "cover_landscape_path" in columns, "已有库缺少横封面列，迁移未生效"

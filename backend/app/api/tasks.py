@@ -524,6 +524,9 @@ async def publish_item(
         logger.info("手动发布走定时：item=%s schedule_at=%s", item_id, schedule_at)
 
     cover = settings.data_dir / item.cover_path if item.cover_path else None
+    cover_landscape = (
+        settings.data_dir / item.cover_landscape_path if item.cover_landscape_path else None
+    )
     try:
         result = await publisher.publish(
             PublishRequest(
@@ -531,6 +534,9 @@ async def publish_item(
                 title=item.title_zh or item.title or f"搬运视频 {item.id}",
                 tags=list(item.tags or config["publish"].get("default_tags") or []),
                 cover_path=cover if cover and cover.exists() else None,
+                cover_landscape_path=(
+                    cover_landscape if cover_landscape and cover_landscape.exists() else None
+                ),
                 description=str(options.get("description") or ""),
                 schedule_at=schedule_at,
                 dry_run=dry_run,
@@ -568,18 +574,37 @@ async def publish_item(
     return TaskItemOut.model_validate(item)
 
 
+def _thumbnail_relative(item: TaskItem) -> Path | None:
+    """下载阶段落盘的 YouTube 缩略图（16:9，1280x720），与源视频同目录。
+
+    条目列表用它做封面，比 covers/ 里那张「成片抽帧」的竖版封面合适：
+    竖版（1080x1920）塞进 88x50 的横框会被裁掉大半。
+    """
+    if not item.video_path:
+        return None
+    candidate = settings.data_dir / item.video_path
+    for suffix in (".webp", ".jpg", ".png"):
+        thumb = candidate.with_suffix(suffix)
+        if thumb.exists():
+            return thumb
+    return None
+
+
 @router.get("/{task_id}/items/{item_id}/file")
 async def download_item_file(
     task_id: int,
     item_id: int,
-    kind: str = Query(default="output", pattern="^(output|cover|subtitle_zh|subtitle_source|video|audio)$"),
+    kind: str = Query(
+        default="output",
+        pattern="^(output|cover|thumbnail|subtitle_zh|subtitle_source|video|audio)$",
+    ),
     inline: bool = Query(
         default=False,
         description="true 时以 inline 方式返回，供页面内嵌播放；false 则作为附件下载",
     ),
     session: AsyncSession = Depends(get_session),
 ) -> FileResponse:
-    """获取条目产物（成片/封面/字幕等）。
+    """获取条目产物（成片/封面/缩略图/字幕等）。
 
     Starlette 的 FileResponse 原生支持 Range 请求，因此 <video> 可以正常拖动进度条，
     大文件也不会被整体读进内存。
@@ -591,6 +616,7 @@ async def download_item_file(
     mapping = {
         "output": item.output_path,
         "cover": item.cover_path,
+        "thumbnail": str(_thumbnail_relative(item)) if _thumbnail_relative(item) else "",
         "subtitle_zh": item.subtitle_zh_path,
         "subtitle_source": item.subtitle_source_path,
         "video": item.video_path,

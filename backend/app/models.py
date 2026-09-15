@@ -141,6 +141,9 @@ class TaskItem(Base):
     dubbed_audio_path: Mapped[str] = mapped_column(Text, default="")
     output_path: Mapped[str] = mapped_column(Text, default="")
     cover_path: Mapped[str] = mapped_column(Text, default="")
+    # 横封面（抖音要求 4:3）。平台对「竖封面」与「横封面」分别取图，
+    # 只设竖封面会导致横版位缺失。
+    cover_landscape_path: Mapped[str] = mapped_column(Text, default="")
 
     # 发布结果
     publish_status: Mapped[str] = mapped_column(String(32), default="")

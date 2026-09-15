@@ -36,6 +36,30 @@ async def init_db() -> None:
             await conn.execute(text("PRAGMA journal_mode=WAL"))
             await conn.execute(text("PRAGMA synchronous=NORMAL"))
         await conn.run_sync(Base.metadata.create_all)
+        await _ensure_columns(conn)
+
+
+# 新增列清单：create_all 不会改动已存在的表，已有库需要补列。
+# SQLite 的 ALTER TABLE ADD COLUMN 是轻量操作，这里做加法式迁移。
+_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
+    "task_items": {
+        "cover_landscape_path": "TEXT DEFAULT ''",
+    },
+}
+
+
+async def _ensure_columns(conn) -> None:
+    from sqlalchemy import text
+
+    for table, columns in _ADDITIVE_COLUMNS.items():
+        try:
+            result = await conn.execute(text(f"PRAGMA table_info({table})"))
+            existing = {row[1] for row in result.fetchall()}
+        except Exception:  # noqa: BLE001 - 表可能还不存在
+            continue
+        for name, ddl in columns.items():
+            if name not in existing:
+                await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

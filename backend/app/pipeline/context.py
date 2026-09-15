@@ -184,6 +184,7 @@ class ItemPaths:
     dub_audio: Path
     output: Path
     cover: Path
+    cover_landscape: Path
     work_dir: Path
 
 
@@ -201,6 +202,7 @@ def build_item_paths(task_id: int, item: TaskItem) -> ItemPaths:
         dub_audio=audio_dir / "dub.mp3",
         output=settings.outputs_dir / str(task_id) / f"{key}.mp4",
         cover=settings.covers_dir / str(task_id) / f"{key}.jpg",
+        cover_landscape=settings.covers_dir / str(task_id) / f"{key}_landscape.jpg",
         work_dir=audio_dir / "work",
     )
 

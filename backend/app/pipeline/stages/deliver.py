@@ -113,6 +113,10 @@ async def stage_publish(ctx: StageContext, state: ItemState) -> None:
         title=title,
         tags=tags,
         cover_path=state.paths.cover if state.paths.cover.exists() else None,
+        # 抖音的竖/横封面分开取图，横封面固定 4:3；两个都要传，否则横版位为空
+        cover_landscape_path=(
+            state.paths.cover_landscape if state.paths.cover_landscape.exists() else None
+        ),
         description=description,
         schedule_at=schedule_at,
         headless=bool(publish_cfg.get("headless", False)),
@@ -190,18 +194,29 @@ async def _generate_cover(ctx: StageContext, state: ItemState, title: str, tags:
                     cover_mod.CoverStyle(width=width, height=height),
                     state.paths.cover,
                 )
+                # 横封面（4:3）独立生成：抖音对竖/横两种封面分别取图
+                lw, lh = cover_mod.LANDSCAPE_COVER_SIZE
+                await asyncio.to_thread(
+                    cover_mod.build_thumbnail_cover,
+                    data,
+                    cover_mod.CoverStyle(width=lw, height=lh),
+                    state.paths.cover_landscape,
+                )
                 state.stats["cover"] = {
                     "mode": "thumbnail",
                     "size": f"{width}x{height}",
+                    "landscape_size": f"{lw}x{lh}",
                     "source_url": cover_mod.best_thumbnail_url(state.item.thumbnail or "")[:200],
                 }
                 await ctx.reporter.item_update(
                     state.item.id,
                     cover_path=ctx.relative(state.paths.cover),
+                    cover_landscape_path=ctx.relative(state.paths.cover_landscape),
                     stats={**state.item.stats, **state.stats},
                 )
                 await ctx.reporter.log(
-                    f"已使用视频原始缩略图作为封面：{width}x{height}", stage="metadata", item_id=state.item.id
+                    f"已使用视频原始缩略图作为封面：竖 {width}x{height}、横 {lw}x{lh}",
+                    stage="metadata", item_id=state.item.id,
                 )
                 return
             except Exception as exc:  # noqa: BLE001
@@ -218,9 +233,13 @@ async def _generate_cover(ctx: StageContext, state: ItemState, title: str, tags:
     if source_mode == "frame":
         try:
             await ffmpeg_utils.extract_cover(source, state.paths.cover, at=1.0)
-            state.stats["cover"] = {"mode": "frame", "size": f"{width}x{height}"}
+            lw, lh = cover_mod.LANDSCAPE_COVER_SIZE
+            await ffmpeg_utils.extract_cover(source, state.paths.cover_landscape, at=1.0)
+            state.stats["cover"] = {"mode": "frame", "size": f"{width}x{height}",
+                                    "landscape_size": f"{lw}x{lh}"}
             await ctx.reporter.item_update(
                 state.item.id, cover_path=ctx.relative(state.paths.cover),
+                cover_landscape_path=ctx.relative(state.paths.cover_landscape),
                 stats={**state.item.stats, **state.stats},
             )
         except Exception as exc:  # noqa: BLE001
@@ -247,21 +266,42 @@ async def _generate_cover(ctx: StageContext, state: ItemState, title: str, tags:
             frame_at=min(1.0, max(0.1, (media.duration if media else 12) / 10)),
             work_dir=state.paths.work_dir / "cover",
         )
+        lw, lh = cover_mod.LANDSCAPE_COVER_SIZE
+        landscape_style = cover_mod.CoverStyle(
+            width=lw, height=lh, theme=str(video_cfg.get("cover_theme", "tech_blue")),
+            brand=str(video_cfg.get("cover_brand", "") or ""),
+            max_tags=int(video_cfg.get("cover_max_tags", 4)),
+            background=str(video_cfg.get("cover_background", "generated")),
+            source=source_mode,
+        )
+        await asyncio.to_thread(
+            cover_mod.generate_cover,
+            video=source, title=state.item.title_zh or title,
+            tags=list(state.item.tags or tags), out_path=state.paths.cover_landscape,
+            style=landscape_style,
+            frame_at=min(1.0, max(0.1, (media.duration if media else 12) / 10)),
+            work_dir=state.paths.work_dir / "cover_landscape",
+        )
     except Exception as exc:  # noqa: BLE001 - 封面失败不应影响发布主流程
         await ctx.reporter.log(
             f"封面生成失败，将退回抽帧：{exc}", level="warning", stage="metadata", item_id=state.item.id
         )
         try:
             await ffmpeg_utils.extract_cover(source, state.paths.cover, at=1.0)
+            await ffmpeg_utils.extract_cover(source, state.paths.cover_landscape, at=1.0)
         except Exception:  # noqa: BLE001
             return
 
+    lw, lh = cover_mod.LANDSCAPE_COVER_SIZE
     state.stats["cover"] = {"mode": "generated", "size": f"{width}x{height}",
+                            "landscape_size": f"{lw}x{lh}",
                             "theme": video_cfg.get("cover_theme", "tech_blue")}
     await ctx.reporter.item_update(
-        state.item.id, cover_path=ctx.relative(state.paths.cover), stats={**state.item.stats, **state.stats}
+        state.item.id, cover_path=ctx.relative(state.paths.cover),
+        cover_landscape_path=ctx.relative(state.paths.cover_landscape),
+        stats={**state.item.stats, **state.stats},
     )
     await ctx.reporter.log(
-        f"已生成设计封面：{width}x{height}，含标题与 {len(state.item.tags or tags)} 个标签",
+        f"已生成设计封面：竖 {width}x{height}、横 {lw}x{lh}，含标题与 {len(state.item.tags or tags)} 个标签",
         stage="metadata", item_id=state.item.id,
     )
