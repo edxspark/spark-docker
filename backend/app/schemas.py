@@ -200,3 +200,6 @@ class PublishItemRequest(BaseModel):
     """
 
     immediate: bool = True
+    # 干跑：完整上传并填好表单，但停在「发布」按钮前，不真正发出作品。
+    # 用于发布前自检，避免第一次失败发生在视频已上传之后。
+    dry_run: bool = False

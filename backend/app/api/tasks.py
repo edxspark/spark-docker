@@ -471,6 +471,7 @@ async def publish_item(
         raise HTTPException(status_code=400, detail=f"成片文件不存在：{output}")
 
     immediate = True if payload is None else payload.immediate
+    dry_run = bool(payload.dry_run) if payload is not None else False
 
     config = await settings_store.load_all(session)
     publisher = build_publisher(PublishConfig(**config["publish"]), settings.auth_dir / "douyin_default.json")
@@ -495,6 +496,7 @@ async def publish_item(
                 cover_path=cover if cover and cover.exists() else None,
                 description=str(options.get("description") or ""),
                 schedule_at=schedule_at,
+                dry_run=dry_run,
             )
         )
     except Exception as exc:  # noqa: BLE001
@@ -502,6 +504,13 @@ async def publish_item(
         item.publish_error = str(exc)
         await session.commit()
         raise HTTPException(status_code=502, detail=f"发布失败：{exc}") from exc
+
+    if dry_run:
+        # 干跑只是自检：不写入「已发布」，也不记录作品链接
+        item.message = f"[干跑] {result.message}"[:400]
+        await session.commit()
+        await session.refresh(item)
+        return TaskItemOut.model_validate(item)
 
     item.publish_status = "published" if result.success else "failed"
     item.publish_url = result.work_url

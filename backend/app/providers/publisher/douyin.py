@@ -410,7 +410,28 @@ class DouyinPublisher(BasePublisher):
                 if request.schedule_at:
                     await self._set_schedule(page, request.schedule_at)
 
-                # 7) 发布
+                # 7) 发布（干跑时到此为止）
+                if request.dry_run:
+                    checks = await self._dry_run_report(page)
+                    screenshot = state_path = None
+                    try:
+                        state_path = Path(self.account_file).with_suffix(".dryrun.png")
+                        await page.screenshot(path=str(state_path), full_page=True)
+                        screenshot = str(state_path)
+                    except Exception:  # noqa: BLE001 - 截图失败不影响结论
+                        screenshot = None
+                    await context.storage_state(path=str(self.account_file))
+                    return PublishResult(
+                        success=True,
+                        work_url="",
+                        message=(
+                            "干跑通过：已上传视频并填好标题/正文/话题，"
+                            "停在「发布」按钮前，未真正发布。"
+                            f"校验结果 {checks}"
+                        ),
+                        raw={"dry_run": True, "checks": checks, "screenshot": screenshot},
+                    )
+
                 await self._click_publish(page, timeout_ms)
 
                 work_url = ""
@@ -432,6 +453,35 @@ class DouyinPublisher(BasePublisher):
             finally:
                 await context.close()
                 await browser.close()
+
+    async def _dry_run_report(self, page) -> dict:
+        """干跑时的关键校验：确认走到发布页、标题已填、上传已完成、发布按钮可点。"""
+        checks: dict[str, object] = {"url": page.url}
+        try:
+            title_input = await _first_visible(page, TITLE_INPUT_SELECTORS, timeout=5000)
+            checks["title_input_found"] = title_input is not None
+            if title_input is not None:
+                checks["title_value"] = (await title_input.input_value())[:60]
+        except Exception as exc:  # noqa: BLE001
+            checks["title_error"] = str(exc)[:120]
+
+        checks["editor_found"] = (
+            await _first_visible(page, DESCRIPTION_SELECTORS, timeout=5000)
+        ) is not None
+
+        upload_done = await _exists(page, UPLOAD_DONE_SELECTORS)
+        checks["upload_finished"] = upload_done
+        checks["upload_failed"] = await _exists(page, UPLOAD_FAILED_SELECTORS)
+
+        publish_button = await _first_visible(page, PUBLISH_BUTTON_SELECTORS, timeout=5000)
+        checks["publish_button_found"] = publish_button is not None
+        if publish_button is not None:
+            try:
+                checks["publish_button_enabled"] = await publish_button.is_enabled()
+            except Exception:  # noqa: BLE001
+                checks["publish_button_enabled"] = None
+        checks["needs_verification"] = await _exists(page, VERIFICATION_SELECTORS)
+        return checks
 
     async def _wait_publish_page(self, page, timeout_ms: int) -> None:
         loop = asyncio.get_running_loop()

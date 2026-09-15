@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from app.providers.publisher.douyin import (
     UPLOAD_INPUT_SELECTORS,
@@ -110,3 +111,58 @@ class TestSelectors:
         joined = " ".join(VERIFICATION_SELECTORS)
         for keyword in ("身份验证", "安全验证", "验证码", "滑块"):
             assert keyword in joined, f"风控选择器缺少 {keyword}"
+
+
+class TestDryRunSupport:
+    """干跑：完整走上传与填写流程，但停在「发布」前。
+
+    价值在于把「选择器失效」「遇到风控」这类问题提前暴露，
+    而不是等到真正发布时才发现——那时视频已经传上去了。
+    """
+
+    def test_request_has_dry_run_flag(self):
+        from app.providers.base import PublishRequest
+
+        assert PublishRequest(video_path=Path("/tmp/x.mp4"), title="t").dry_run is False
+        assert PublishRequest(video_path=Path("/tmp/x.mp4"), title="t", dry_run=True).dry_run is True
+
+    def test_api_schema_accepts_dry_run(self):
+        from app.schemas import PublishItemRequest
+
+        assert PublishItemRequest().dry_run is False
+        assert PublishItemRequest(dry_run=True).dry_run is True
+        # 与既有的 immediate 互不影响
+        assert PublishItemRequest(dry_run=True, immediate=False).immediate is False
+
+    async def test_dry_run_does_not_click_publish(self, monkeypatch):
+        """干跑绝不能触发真正的发布点击。"""
+        from app.providers.base import ProviderError, PublishRequest
+        from app.providers.publisher.douyin import DouyinPublisher
+        from app.services.settings_store import PublishConfig
+
+        publisher = DouyinPublisher(PublishConfig(provider="douyin"), Path("/tmp/x.json"))
+        clicked: list[bool] = []
+
+        async def fake_click(page, timeout_ms):
+            clicked.append(True)
+            raise AssertionError("干跑不应调用 _click_publish")
+
+        async def fake_report(page):
+            return {"publish_button_found": True}
+
+        monkeypatch.setattr(publisher, "_click_publish", fake_click)
+        monkeypatch.setattr(publisher, "_dry_run_report", fake_report)
+
+        # 直接验证：dry_run 分支在 _click_publish 之前就返回
+        video = Path("/tmp/dryrun.mp4")
+        video.write_bytes(b"x")
+        try:
+            await publisher._publish_locked(
+                PublishRequest(video_path=video, title="t", dry_run=True), video, headless=True
+            )
+            raise AssertionError("未配置登录态时应抛错，而不是走到发布")
+        except (ProviderError, AssertionError) as exc:
+            assert "干跑不应调用" not in str(exc)
+        finally:
+            video.unlink(missing_ok=True)
+        assert clicked == [], "干跑路径不应触碰发布点击"

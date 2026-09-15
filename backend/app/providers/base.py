@@ -153,6 +153,9 @@ class PublishRequest:
     description: str = ""
     schedule_at: str | None = None        # "YYYY-MM-DD HH:MM"
     headless: bool = False
+    # 干跑：完整走到「发布」按钮前停下，验证选择器与流程，但不真正发出作品。
+    # 用于真实发布前自检——否则第一次失败往往发生在最贵的环节（视频已上传）。
+    dry_run: bool = False
 
 
 @dataclass
