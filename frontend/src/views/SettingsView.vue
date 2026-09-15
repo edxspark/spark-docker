@@ -125,6 +125,18 @@ const FIELD_META: Record<string, FieldMeta> = {
   'download.write_thumbnail': { label: '下载缩略图', type: 'switch', help: '缩略图会作为抖音封面候选' },
   'download.cookies_file': { label: 'Cookies 文件', type: 'text', help: 'YouTube 需要登录（如年龄限制视频）时，填写 cookies.txt 的绝对路径' },
   'download.proxy': { label: '代理地址', type: 'text', help: '例如 http://127.0.0.1:7890。中国大陆环境访问 YouTube 通常必须配置' },
+  'download.js_runtime': {
+    label: 'JavaScript 运行时',
+    type: 'select',
+    options: [
+      { label: '自动探测（推荐）', value: '' },
+      { label: 'deno', value: 'deno' },
+      { label: 'node', value: 'node' },
+      { label: 'bun', value: 'bun' },
+      { label: 'quickjs', value: 'quickjs' },
+    ],
+    help: 'YouTube 提取需要 JS 运行时解算签名。留空则由系统自动探测（deno > node > bun > quickjs），本机通常用 node',
+  },
   'download.retries': { label: '重试次数', type: 'number', min: 0, max: 20 },
   'download.sleep_interval': { label: '分片间隔（秒）', type: 'number', min: 0, max: 60, step: 0.5, help: '每个分片下载后等待，降低被限流的概率' },
   'download.rate_limit': { label: '限速', type: 'text', help: '例如 5M 表示限制为 5 MB/s，留空表示不限速' },
@@ -407,10 +419,24 @@ function fieldHelp(section: string, key: string, meta: FieldMeta): string {
 function runtimeTags() {
   const info = runtime.value
   if (!info) return []
+  const jsRuntime = info.js_runtime
   return [
     { label: 'ffmpeg', ok: !!info.ffmpeg?.available, tip: info.ffmpeg?.path || '未检测到，请执行 brew install ffmpeg' },
     { label: 'ffprobe', ok: !!info.ffprobe?.available, tip: info.ffprobe?.path || '未检测到' },
     { label: 'yt-dlp', ok: !!info.yt_dlp?.available, tip: info.yt_dlp?.version || '未安装' },
+    {
+      label: `JS 运行时${jsRuntime?.name ? '（' + jsRuntime.name + '）' : ''}`,
+      ok: !!jsRuntime?.available,
+      tip:
+        jsRuntime?.path ||
+        '未找到 JavaScript 运行时，YouTube 提取需要它：brew install deno，或确保 node 在 PATH 中',
+    },
+    {
+      label: 'TLS 伪装',
+      ok: !!info.impersonation?.available,
+      tip: info.impersonation?.note || '缺少 curl-cffi 时 YouTube 可能拒绝请求',
+    },
+    { label: 'EJS 求解器', ok: !!info.ejs?.available, tip: info.ejs?.note || '' },
     {
       label: 'playwright',
       ok: !!info.playwright?.available,
@@ -456,7 +482,8 @@ onMounted(async () => {
         <el-tag v-if="runtime?.python" effect="plain">Python {{ runtime.python }}</el-tag>
       </div>
       <div v-if="runtime" class="muted env-tip">
-        ffmpeg 与 yt-dlp 为流水线必需项。缺少 ffmpeg 时无法合成与烧录字幕；缺少 playwright 时无法真实发布到抖音。
+        ffmpeg、yt-dlp 与 JavaScript 运行时是下载链路的必需项；TLS 伪装（curl-cffi）缺失时 YouTube
+        会拒绝请求。缺任何一项都会在下载阶段失败，建议跑任务前先确认这里全绿。
       </div>
       <el-descriptions v-if="paths" :column="2" size="small" border style="margin-top: 14px">
         <el-descriptions-item label="数据根目录">

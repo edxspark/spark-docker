@@ -6,7 +6,7 @@ import asyncio
 import logging
 from pathlib import Path
 
-from app.pipeline.context import ItemState, StageContext
+from app.pipeline.context import ItemState, StageContext, make_threadsafe_progress
 from app.providers.base import ProviderError
 from app.services.subtitles import (
     merge_into_sentences,
@@ -72,20 +72,21 @@ async def stage_download(ctx: StageContext, state: ItemState) -> None:
 
     last_message = ""
 
+    # yt-dlp 的 progress_hook 在工作线程里同步执行；必须在协程中先拿到 loop，
+    # 否则 hook 会抛 RuntimeError 并中断下载（详见 make_threadsafe_progress 的说明）。
+    schedule_progress = make_threadsafe_progress(asyncio.get_running_loop())
+
     def on_progress(percent: float, message: str) -> None:
         nonlocal last_message
         last_message = message
-        # yt-dlp 的 progress_hook 在下载线程里同步执行，这里把上报排回事件循环
-        loop = asyncio.get_event_loop()
-        loop.call_soon_threadsafe(
-            asyncio.create_task,
+        schedule_progress(
             ctx.reporter.item_stage(
                 state.item.id,
                 "download",
                 percent,
                 message,
                 overall=ctx.overall_for("download", percent),
-            ),
+            )
         )
 
     await ctx.reporter.item_stage(state.item.id, "download", 0, "开始下载…", overall=ctx.overall_for("download", 0))

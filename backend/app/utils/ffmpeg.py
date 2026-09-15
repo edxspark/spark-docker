@@ -4,33 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from app.core.config import settings
+from app.utils import binaries
 
 
 class FFmpegError(RuntimeError):
     pass
 
 
-# 常见安装位置：GUI 启动的进程往往拿不到 shell 的 PATH（如 Homebrew）
-_EXTRA_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/usr/bin")
-
-
 def resolve_binary(name: str) -> str | None:
-    """在 PATH 与常见目录中查找可执行文件。"""
-    found = shutil.which(name)
-    if found:
-        return found
-    for directory in _EXTRA_BIN_DIRS:
-        candidate = Path(directory) / name
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    return None
+    """在 PATH 与常见目录中查找可执行文件（实现见 app.utils.binaries）。"""
+    return binaries.resolve_binary(name)
 
 
 _cache: dict[str, str | None] = {}
@@ -45,7 +34,12 @@ def _bin(name: str) -> str:
     return resolved
 
 
+def ffmpeg_available() -> bool:
+    return bool(resolve_binary(settings.ffmpeg_bin)) and bool(resolve_binary(settings.ffprobe_bin))
+
+
 async def _run(cmd: list[str], *, timeout: float | None = None) -> tuple[int, str, str]:
+    """执行外部命令，返回 (退出码, stdout, stderr)。超时会终止进程。"""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -58,10 +52,6 @@ async def _run(cmd: list[str], *, timeout: float | None = None) -> tuple[int, st
         await proc.wait()
         raise FFmpegError(f"命令超时（{timeout}s）: {' '.join(cmd[:3])} ...") from None
     return proc.returncode or 0, stdout.decode("utf-8", "ignore"), stderr.decode("utf-8", "ignore")
-
-
-def ffmpeg_available() -> bool:
-    return bool(resolve_binary(settings.ffmpeg_bin)) and bool(resolve_binary(settings.ffprobe_bin))
 
 
 async def run_ffmpeg(args: list[str], *, timeout: float | None = 3600) -> None:

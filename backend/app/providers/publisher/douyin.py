@@ -206,8 +206,8 @@ class DouyinAuthManager:
                     except Exception:  # noqa: BLE001
                         pass
 
-                    deadline = asyncio.get_event_loop().time() + timeout
-                    while asyncio.get_event_loop().time() < deadline:
+                    deadline = asyncio.get_running_loop().time() + timeout
+                    while asyncio.get_running_loop().time() < deadline:
                         if "creator.douyin.com/creator-micro" in page.url:
                             break
                         if await _exists(page, ('text=二维码失效', "text=二维码已失效")):
@@ -362,7 +362,7 @@ class DouyinPublisher(BasePublisher):
                 await browser.close()
 
     async def _wait_publish_page(self, page, timeout_ms: int) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_ms / 1000
         while loop.time() < deadline:
             for pattern in PUBLISH_URL_PATTERNS:
@@ -405,7 +405,7 @@ class DouyinPublisher(BasePublisher):
         await page.keyboard.press("Escape")
 
     async def _wait_upload_finished(self, page, video_path: Path, timeout_ms: int) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_ms / 1000
         reported = 0.0
         while loop.time() < deadline:
@@ -506,7 +506,7 @@ class DouyinPublisher(BasePublisher):
         await page.wait_for_timeout(1000)
 
     async def _click_publish(self, page, timeout_ms: int) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_ms / 1000
         while loop.time() < deadline:
             button = await _first_visible(page, PUBLISH_BUTTON_SELECTORS, timeout=5000)

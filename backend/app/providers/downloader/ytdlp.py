@@ -15,8 +15,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.core.config import settings
 from app.providers.base import DownloadResult, ProbeResult, ProviderError, VideoInfo
 from app.services.settings_store import DownloadConfig
+from app.utils import binaries
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,19 @@ def _base_opts(config: DownloadConfig) -> dict[str, Any]:
         opts["sleep_interval"] = config.sleep_interval
     if config.rate_limit:
         opts["ratelimit"] = config.rate_limit
+
+    # yt-dlp 需要自己找到 ffmpeg 才能合并音视频。GUI 启动的进程 PATH 里通常没有
+    # Homebrew，会导致「ffmpeg is not installed」而合并失败，因此显式告知路径。
+    ffmpeg_path = binaries.resolve_binary(settings.ffmpeg_bin)
+    if ffmpeg_path:
+        opts["ffmpeg_location"] = str(Path(ffmpeg_path).parent)
+
+    # YouTube 提取需要 JavaScript 运行时解算签名；yt-dlp 默认只启用 deno，
+    # 本机更常见的是 node，因此主动探测并显式启用。
+    runtime = binaries.resolve_js_runtime(config.js_runtime)
+    if runtime:
+        name, path = runtime
+        opts["js_runtimes"] = {name: {"path": path}}
     return opts
 
 
@@ -160,6 +175,24 @@ def _friendly_error(exc: Exception, url: str = "", action: str = "解析链接")
         return (
             f"{action}失败：被 YouTube 拒绝（403）。常见原因是 IP 被限流或需要登录，"
             f"可尝试配置代理或 cookies 文件后重试。（原始错误：{text[:300]}）"
+        )
+    if "impersonat" in lowered:
+        return (
+            f"{action}失败：缺少 impersonation 支持（TLS 指纹伪装），YouTube 会因此拒绝请求。"
+            "请在 backend 目录执行：uv pip install curl-cffi，然后重启服务。"
+            f"（原始错误：{text[:300]}）"
+        )
+    if "javascript runtime" in lowered or "js runtime" in lowered:
+        return (
+            f"{action}失败：未找到 JavaScript 运行时，YouTube 提取需要它。"
+            "任选其一：brew install deno，或确保 node 在 PATH 中（本项目会自动探测并启用）。"
+            f"（原始错误：{text[:300]}）"
+        )
+    if "ffmpeg is not installed" in lowered or "ffmpeg not found" in lowered:
+        return (
+            f"{action}失败：yt-dlp 找不到 ffmpeg，无法合并音视频。"
+            "请执行 brew install ffmpeg，然后重启服务。"
+            f"（原始错误：{text[:300]}）"
         )
     return f"{action}失败：{text[:400] or 'yt-dlp 未返回任何错误信息'}"
 

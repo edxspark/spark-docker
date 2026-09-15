@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 from pathlib import Path
@@ -243,3 +244,207 @@ class TestAnsiStripping:
         assert _strip_ansi("\x1b[1;32mOK\x1b[0m") == "OK"
         assert _strip_ansi("plain") == "plain"
         assert _strip_ansi("") == ""
+
+
+class TestBaseOptsWiring:
+    """yt-dlp 需要知道 ffmpeg 与 JS 运行时的位置，否则会在下载/合并阶段失败。"""
+
+    def test_sets_ffmpeg_location_when_available(self):
+        from app.providers.downloader.ytdlp import _base_opts
+        from app.utils.binaries import resolve_binary
+
+        ffmpeg = resolve_binary("ffmpeg")
+        opts = _base_opts(DownloadConfig())
+        if ffmpeg:
+            assert opts.get("ffmpeg_location"), "未把 ffmpeg 目录告知 yt-dlp"
+            assert Path(opts["ffmpeg_location"]).joinpath("ffmpeg").exists() or Path(
+                opts["ffmpeg_location"]
+            ).joinpath("ffmpeg.exe").exists(), "ffmpeg_location 不是可用的目录"
+        else:
+            assert "ffmpeg_location" not in opts
+
+    def test_sets_js_runtimes_when_available(self):
+        from app.providers.downloader.ytdlp import _base_opts
+        from app.utils.binaries import resolve_js_runtime
+
+        runtime = resolve_js_runtime()
+        opts = _base_opts(DownloadConfig())
+        if runtime:
+            name, path = runtime
+            assert opts.get("js_runtimes") == {name: {"path": path}}
+        else:
+            assert "js_runtimes" not in opts
+
+    def test_js_runtime_format_matches_ytdlp_schema(self):
+        """yt-dlp 要求 {runtime: {config}}；传错格式会直接抛 ValueError。"""
+        from app.providers.downloader.ytdlp import _base_opts
+
+        opts = _base_opts(DownloadConfig())
+        runtimes = opts.get("js_runtimes")
+        if runtimes is None:
+            pytest.skip("本机没有可用的 JS 运行时")
+        assert isinstance(runtimes, dict)
+        for name, config in runtimes.items():
+            assert isinstance(name, str)
+            assert config is None or isinstance(config, dict)
+
+    def test_ignoreerrors_default_off(self):
+        """回归：ignoreerrors 一旦开启，yt-dlp 的真实错误会被整体吞掉。"""
+        from app.providers.downloader.ytdlp import _base_opts
+
+        assert _base_opts(DownloadConfig())["ignoreerrors"] is False
+
+
+class TestJsRuntimeResolution:
+    def test_returns_name_and_path(self):
+        from app.utils.binaries import resolve_js_runtime
+
+        runtime = resolve_js_runtime()
+        if runtime is None:
+            pytest.skip("本机没有可用的 JS 运行时")
+        name, path = runtime
+        assert name in ("deno", "node", "bun", "quickjs")
+        assert Path(path).exists()
+
+    def test_unknown_preference_falls_back_to_autodetect(self):
+        from app.utils.binaries import clear_cache, resolve_js_runtime
+
+        clear_cache()
+        runtime = resolve_js_runtime("not-a-runtime")
+        # 不应抛异常；要么探测到别的运行时，要么返回 None
+        assert runtime is None or runtime[0] in ("deno", "node", "bun", "quickjs")
+
+
+class TestDependencyErrorHints:
+    def test_impersonation_error_is_actionable(self):
+        message = _friendly_error(
+            RuntimeError(
+                "ERROR: The extractor specified to use impersonation for this download, "
+                "but impersonation is not available"
+            ),
+            action="下载视频",
+        )
+        assert "curl-cffi" in message
+
+    def test_js_runtime_error_is_actionable(self):
+        message = _friendly_error(
+            RuntimeError("ERROR: No supported JavaScript runtime could be found."),
+            action="下载视频",
+        )
+        assert "deno" in message or "node" in message
+
+    def test_missing_ffmpeg_error_is_actionable(self):
+        message = _friendly_error(
+            RuntimeError("ERROR: You have requested merging of multiple formats but ffmpeg is not installed"),
+            action="下载视频",
+        )
+        assert "brew install ffmpeg" in message
+
+
+class TestThreadsafeProgress:
+    """回归：进度上报必须在 yt-dlp 的工作线程里也能安全调用。
+
+    真实事故：hook 在工作线程中调用 asyncio.get_event_loop() 会抛 RuntimeError，
+    而 hook 异常会让 yt-dlp 中止整个下载。修复方式是先在协程中取 loop，
+    再用 call_soon_threadsafe 把上报排回去。
+    """
+
+    def test_get_event_loop_raises_in_worker_thread(self):
+        """先固化「为什么会出事」这个事实，避免以后有人改回去。
+
+        显式把线程的事件循环置空，复现 yt-dlp 工作线程所处的环境。
+        """
+        import threading
+
+        result: list[str] = []
+
+        def worker():
+            try:
+                asyncio.set_event_loop(None)
+                asyncio.get_event_loop()
+                result.append("ok")
+            except BaseException as exc:  # noqa: BLE001
+                result.append(type(exc).__name__)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+        assert result == ["RuntimeError"], (
+            f"预计在工作线程里 get_event_loop 会抛 RuntimeError，实际 {result}；"
+            "若 Python 行为已变，请复核 make_threadsafe_progress 的必要性"
+        )
+
+    def test_schedule_from_worker_thread_runs_coroutine(self):
+        from app.pipeline.context import make_threadsafe_progress
+
+        async def main():
+            ran: list[float] = []
+
+            async def report(value: float) -> None:
+                ran.append(value)
+
+            schedule = make_threadsafe_progress(asyncio.get_running_loop())
+
+            def worker():
+                # 模拟 yt-dlp 在工作线程里连续回调
+                for i in range(5):
+                    schedule(report(float(i)))
+
+            await asyncio.to_thread(worker)
+            # 给排队的回调一点时间落地
+            for _ in range(50):
+                if len(ran) == 5:
+                    break
+                await asyncio.sleep(0.01)
+            return ran
+
+        assert asyncio.run(main()) == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+    def test_schedule_after_loop_closed_is_silent(self):
+        """事件循环关闭后调用不应抛异常（任务被取消/服务停机的场景）。"""
+        import threading
+
+        from app.pipeline.context import make_threadsafe_progress
+
+        captured: list = []
+
+        async def main():
+            captured.append(make_threadsafe_progress(asyncio.get_running_loop()))
+
+        asyncio.run(main())
+        schedule = captured[0]
+
+        async def never_awaited() -> None:  # pragma: no cover - 不应被执行
+            raise AssertionError("关闭后的回调不应执行")
+
+        errors: list[BaseException] = []
+
+        def worker():
+            try:
+                schedule(never_awaited())
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+        assert errors == [], f"关闭 loop 后调用抛异常了：{errors}"
+
+    def test_scheduler_is_reusable_and_ordered(self):
+        from app.pipeline.context import make_threadsafe_progress
+
+        async def main():
+            seen: list[str] = []
+
+            async def report(tag: str) -> None:
+                seen.append(tag)
+
+            schedule = make_threadsafe_progress(asyncio.get_running_loop())
+            await asyncio.to_thread(lambda: [schedule(report("a")) or schedule(report("b"))])
+            for _ in range(50):
+                if len(seen) == 2:
+                    break
+                await asyncio.sleep(0.01)
+            return seen
+
+        assert asyncio.run(main()) == ["a", "b"]

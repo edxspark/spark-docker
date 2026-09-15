@@ -22,6 +22,7 @@ from app.services.settings_store import (
     TTSConfig,
     settings_store,
 )
+from app.utils import binaries
 from app.utils import ffmpeg as ffmpeg_utils
 
 logger = logging.getLogger(__name__)
@@ -64,13 +65,26 @@ async def list_voices() -> dict:
 
 
 @router.get("/runtime")
-async def runtime_info() -> dict:
-    """运行环境自检：ffmpeg / yt-dlp / playwright / 磁盘。"""
+async def runtime_info(refresh: bool = False) -> dict:
+    """运行环境自检：ffmpeg / yt-dlp / JS 运行时 / impersonation / playwright。
+
+    下载链路依赖较多，缺任何一项都会在下载阶段失败，因此这里一次性列全，
+    让用户能在跑任务前就发现问题。
+    """
+    if refresh:
+        binaries.clear_cache()
+
     ffmpeg_path = ffmpeg_utils.resolve_binary(settings.ffmpeg_bin) or ""
     ffprobe_path = ffmpeg_utils.resolve_binary(settings.ffprobe_bin) or ""
+    runtime = binaries.resolve_js_runtime()
     info: dict = {
         "ffmpeg": {"available": bool(ffmpeg_path), "path": ffmpeg_path},
         "ffprobe": {"available": bool(ffprobe_path), "path": ffprobe_path},
+        "js_runtime": {
+            "available": runtime is not None,
+            "name": runtime[0] if runtime else "",
+            "path": runtime[1] if runtime else "",
+        },
         "data_dir": str(settings.data_dir),
         "python": "",
     }
@@ -86,6 +100,28 @@ async def runtime_info() -> dict:
         info["yt_dlp"] = {"available": True, "version": yt_dlp.version.__version__}
     except Exception:  # noqa: BLE001
         info["yt_dlp"] = {"available": False, "version": ""}
+
+    # YouTube 提取的两个关键可选依赖
+    try:
+        import curl_cffi  # noqa: F401
+
+        info["impersonation"] = {"available": True, "note": "curl-cffi 已安装，支持 TLS 指纹伪装"}
+    except Exception:  # noqa: BLE001
+        info["impersonation"] = {
+            "available": False,
+            "note": "缺少 curl-cffi，YouTube 可能拒绝请求：uv pip install curl-cffi",
+        }
+    try:
+        import importlib.util
+
+        has_ejs = importlib.util.find_spec("yt_dlp_ejs") is not None
+        info["ejs"] = {
+            "available": has_ejs,
+            "note": "yt-dlp-ejs 已安装" if has_ejs else "缺少 yt-dlp-ejs，可能拿不到全部清晰度：uv pip install yt-dlp-ejs",
+        }
+    except Exception:  # noqa: BLE001
+        info["ejs"] = {"available": False, "note": ""}
+
     try:
         import playwright  # noqa: F401
 

@@ -15,6 +15,12 @@ dependencies = [
     "python-multipart>=0.0.9",
     "cryptography>=42.0.0",
     "yt-dlp>=2024.8.6",
+    # YouTube 提取所需：
+    #  - curl-cffi 提供 impersonation（TLS 指纹伪装），缺失会直接报
+    #    "The extractor specified to use impersonation for this download, but impersonation is not available"
+    #  - yt-dlp-ejs 提供 JS 挑战求解器组件，缺失时会告警并可能拿不到全部清晰度
+    "curl-cffi>=0.7.0",
+    "yt-dlp-ejs>=0.3.0",
     "websockets>=12.0",
 ]
 

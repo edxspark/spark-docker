@@ -83,6 +83,8 @@ class DownloadConfig(BaseModel):
     write_thumbnail: bool = True
     cookies_file: str = ""
     proxy: str = ""
+    # JavaScript 运行时（YouTube 提取需要）。留空自动探测：deno > node > bun > quickjs
+    js_runtime: str = ""
     retries: int = Field(default=5, ge=0, le=20)
     sleep_interval: float = Field(default=0.0, ge=0.0, le=60.0)
     rate_limit: str = ""

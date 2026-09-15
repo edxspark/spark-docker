@@ -182,19 +182,23 @@ async def stage_align(ctx: StageContext, state: ItemState) -> None:
 
     final_audio: Path | None = None
     if state.voice_segments:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def on_progress(percent: float, message: str) -> None:
-            loop.call_soon_threadsafe(
-                asyncio.create_task,
-                ctx.reporter.item_stage(
-                    state.item.id,
-                    "align",
-                    5 + percent * 0.6,
-                    message,
-                    overall=ctx.overall_for("align", 5 + percent * 0.6),
-                ),
-            )
+            try:
+                loop.call_soon_threadsafe(
+                    asyncio.create_task,
+                    ctx.reporter.item_stage(
+                        state.item.id,
+                        "align",
+                        5 + percent * 0.6,
+                        message,
+                        overall=ctx.overall_for("align", 5 + percent * 0.6),
+                    ),
+                )
+            except RuntimeError:
+                # 事件循环已关闭：忽略上报失败，不影响成片渲染
+                pass
 
         voice_track = state.paths.audio_dir / "voice_track.mp3"
         await ffmpeg_utils.build_timeline_track(

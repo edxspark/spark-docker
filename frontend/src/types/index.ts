@@ -172,6 +172,9 @@ export interface TestResult {
 export interface RuntimeInfo {
   ffmpeg: { available: boolean; path: string }
   ffprobe: { available: boolean; path: string }
+  js_runtime?: { available: boolean; name: string; path: string }
+  impersonation?: { available: boolean; note: string }
+  ejs?: { available: boolean; note: string }
   data_dir: string
   python: string
   yt_dlp?: { available: boolean; version: string }

@@ -28,8 +28,16 @@ YouTube 链接
 | Python 3.10+ | 后端 | `brew install uv`（本仓库用 uv 管理虚拟环境） |
 | Node 20+ | 前端 | `brew install node` |
 | **ffmpeg / ffprobe** | 媒体处理（必需） | `brew install ffmpeg` |
-| yt-dlp | 下载（已作为 Python 依赖） | 随后端依赖安装 |
+| **JavaScript 运行时** | YouTube 提取（必需） | 本项目会自动探测：有 `node` 即可；也可 `brew install deno` |
+| yt-dlp / curl-cffi / yt-dlp-ejs | 下载（Python 依赖） | 随后端依赖自动安装 |
 | Playwright + Chromium | 抖音发布（必需） | `pip install playwright && playwright install chromium` |
+
+> **为什么需要 JavaScript 运行时**：YouTube 现在的签名解算依赖 JS 执行，yt-dlp 默认只启用 `deno`。
+> 本机的 `node` 通常已够用——项目会自动探测（deno > node > bun > quickjs）并显式告知 yt-dlp，
+> 无需手工配置。缺 `curl-cffi`（TLS 指纹伪装）时 YouTube 会直接拒绝请求，该依赖已默认安装。
+
+启动后在「系统配置」顶部的**运行环境自检**里可以看到这几项的实时状态；跑长任务前建议先确认全绿。
+下载分组的「连接测试」会真实访问一次 YouTube，是最可靠的连通性验证。
 
 ### 启动
 

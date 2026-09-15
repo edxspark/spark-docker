@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -262,3 +262,28 @@ class StageContext:
 
 
 ProgressFn = Callable[[float, str], Any]
+
+def make_threadsafe_progress(
+    loop: asyncio.AbstractEventLoop,
+) -> Callable[[Awaitable[None]], None]:
+    """返回一个「把协程安全地排回事件循环」的调度函数。
+
+    背景（真实事故）：yt-dlp 的 progress_hook 在工作线程中同步执行。若在该线程里
+    调用 asyncio.get_event_loop()，Python 3.10+ 会抛
+    RuntimeError("There is no current event loop in thread ...")，
+    而 hook 抛出的异常会让 yt-dlp 直接中止整个下载。
+
+    因此必须在协程中先取到 loop，再通过 call_soon_threadsafe 排回事件循环；
+    且上报本身的任何失败都只能被吞掉——绝不能让「显示进度」弄坏「下载」。
+    """
+
+    def schedule(coro: Awaitable[None]) -> None:
+        try:
+            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(coro))
+        except RuntimeError:
+            # 事件循环已关闭（任务取消 / 服务停机）：关闭协程避免 un-awaited 警告
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+
+    return schedule
