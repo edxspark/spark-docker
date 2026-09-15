@@ -160,6 +160,9 @@ class VideoConfig(BaseModel):
     #   frame     —— 直接抽一帧，不做任何设计
     cover_mode: Literal["generated", "frame"] = "generated"
     cover_theme: Literal["tech_blue", "tech_dark", "minimal"] = "tech_blue"
+    # 封面底图：generated 为程序化生成的科技背景（推荐，不受视频内容影响）；
+    # frame 为视频截图——开头是黑/白帧时会得到黑底或白底封面，所以不作默认
+    cover_background: Literal["generated", "frame"] = "generated"
     # 封面左上角的品牌标识，留空则不显示
     cover_brand: str = "AI 译制"
     cover_max_tags: int = Field(default=4, ge=0, le=8)

@@ -184,3 +184,85 @@ class TestTitleWrapping:
 
         assert _wrap_title("", _load_font(40), 900) == []
         assert _wrap_title("   ", _load_font(40), 900) == []
+
+
+class TestGenerativeBackground:
+    """背景必须是生成的，不能依赖视频画面。
+
+    原因：很多视频开头是纯黑或纯白帧，用截图做底图会得到黑底/白底封面，
+    既难看又让文字失去对比度。
+    """
+
+    def _mean_luma(self, path, box=None):
+        from PIL import ImageStat
+
+        with Image.open(path) as im:
+            gray = im.convert("L")
+            return ImageStat.Stat(gray.crop(box) if box else gray).mean[0]
+
+    def test_default_background_is_generated(self):
+        from app.services.cover import CoverStyle
+
+        assert CoverStyle().background == "generated"
+
+    def test_black_video_frame_still_yields_visible_cover(self, tmp_path):
+        """回归：以纯黑视频为源时，封面不能是一片黑。"""
+        import subprocess
+
+        from app.utils.binaries import resolve_binary
+
+        black = tmp_path / "black.mp4"
+        subprocess.run(
+            [
+                resolve_binary("ffmpeg") or "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1",
+                "-f", "lavfi", "-i", "anullsrc", "-shortest",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(black),
+            ],
+            check=True,
+        )
+        out = tmp_path / "cover.jpg"
+        generate_cover(video=black, title="纯黑源视频也要能出封面", tags=["测试"],
+                       out_path=out, style=CoverStyle(width=1080, height=1920))
+        # 早先的 bug：一层 alpha=255 的遮罩把整图涂黑，实测平均亮度只有 4
+        assert self._mean_luma(out, (0, 400, 1080, 1000)) > 20, "背景仍然过黑"
+        assert self._mean_luma(out) > 20
+
+    def test_background_has_visible_structure(self, tmp_path):
+        """背景不能是纯色：应有光晕/网格带来的层次。"""
+        from PIL import ImageChops, ImageStat
+
+        out = tmp_path / "texture.jpg"
+        generate_cover(video=None, title="层次检查", tags=[], out_path=out,
+                       style=CoverStyle(width=1080, height=1920))
+        with Image.open(out) as im:
+            region = im.convert("L").crop((0, 1200, 1080, 1600))  # 无文字的背景区
+            flat = Image.new("L", region.size, int(ImageStat.Stat(region).mean[0]))
+            diff = ImageChops.difference(region, flat)
+            spread = ImageStat.Stat(diff).stddev[0]
+        assert spread > 3, f"背景几乎是纯色（标准差 {spread:.1f}），缺少层次"
+
+    def test_deterministic_for_same_title(self, tmp_path):
+        """同一标题每次生成的背景一致，避免重跑时封面无故变化。"""
+        a = tmp_path / "a.jpg"
+        b = tmp_path / "b.jpg"
+        for path in (a, b):
+            generate_cover(video=None, title="同一标题", tags=[], out_path=path,
+                           style=CoverStyle(width=540, height=960))
+        assert a.read_bytes() == b.read_bytes()
+
+    def test_different_titles_differ(self, tmp_path):
+        a = tmp_path / "ta.jpg"
+        b = tmp_path / "tb.jpg"
+        generate_cover(video=None, title="标题甲", tags=[], out_path=a,
+                       style=CoverStyle(width=540, height=960))
+        generate_cover(video=None, title="标题乙", tags=[], out_path=b,
+                       style=CoverStyle(width=540, height=960))
+        assert a.read_bytes() != b.read_bytes(), "不同视频的封面应略有差异"
+
+    def test_frame_mode_still_available(self, sample_video, tmp_path):
+        """显式选择视频截图作底图时仍应可用（但会压暗以保证文字可读）。"""
+        out = tmp_path / "frame.jpg"
+        generate_cover(video=sample_video, title="截图底图", tags=[], out_path=out,
+                       style=CoverStyle(width=1080, height=1920, background="frame"))
+        assert out.exists()

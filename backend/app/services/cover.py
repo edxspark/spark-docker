@@ -65,6 +65,9 @@ class CoverStyle:
     tag_size: int = 30
     brand: str = "AI 译制"
     max_tags: int = 4
+    # 底图来源：generated 为程序化科技背景（默认，不依赖视频画面）；
+    # frame 为视频截图（开头是黑/白帧时会得到黑底或白底封面）
+    background: str = "generated"
     show_grid: bool = True
     blur_radius: int = 42
     overlay_alpha: int = 205
@@ -88,11 +91,123 @@ def _load_font(size: int):
     return ImageFont.load_default()
 
 
-def _make_background(video: Path, style: CoverStyle, frame_at: float, work_dir: Path):
-    """取一帧、裁成目标比例、重度模糊作为底图。失败时退化为纯渐变。"""
+def _tech_background(style: CoverStyle, *, seed: int = 0):
+    """纯生成式科技背景，完全不依赖视频画面。
+
+    为什么不用视频截图：很多视频开头是纯黑或纯白帧，模糊后得到的是一张
+    黑底或白底，既难看又让文字失去对比度——「封面黑乎乎的」正是这么来的。
+    这里改用程序化绘制的抽象背景，任何视频都能得到稳定、干净的效果。
+
+    构成（全部克制，避免抢标题的视觉焦点）：
+      1. 深色纵向渐变打底；
+      2. 两到三团强调色光晕，位置由标题派生，因此不同视频略有差异但同一视频稳定；
+      3. 细网格 + 由上而下的淡出，提供科技感而不喧宾夺主；
+      4. 一道斜向光带，打破纯渐变的呆板；
+      5. 暗角 + 细颗粒，让画面更耐看、更有质感。
+    """
+    import random
+
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter
+
+    palette = THEMES.get(style.theme, THEMES["tech_blue"])
+    rng = random.Random(seed)
+    width, height = style.width, style.height
+
+    canvas = _vertical_gradient((width, height), palette["top"], palette["bottom"]).convert("RGB")
+
+    # ---- 强调色光晕 ----
+    # Image.radial_gradient 中心黑、边缘白，取反即得到中心亮的光晕蒙版
+    glow_mask_base = Image.radial_gradient("L").resize((width, height), Image.BILINEAR)
+    glow_mask_base = ImageChops.invert(glow_mask_base)
+
+    glow_colors = [palette["accent"], palette["accent2"], palette["accent"]]
+    for index in range(3):
+        scale = rng.uniform(0.55, 0.95)
+        gw = int(width * scale)
+        gh = int(height * scale * rng.uniform(0.5, 0.8))
+        mask = glow_mask_base.resize((max(8, gw), max(8, gh)), Image.BILINEAR)
+        # 亮度：越靠后的光晕越弱，形成层次
+        strength = (110, 84, 62)[index]
+        mask = mask.point(lambda v, k=strength: min(255, int(v * k / 255)))
+        layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        color = glow_colors[index % len(glow_colors)]
+        patch = Image.new("RGBA", mask.size, (*color, 255))
+        patch.putalpha(mask)
+        x = int(rng.uniform(-gw * 0.25, width - gw * 0.5))
+        y = int(rng.uniform(-gh * 0.3, height - gh * 0.5))
+        layer.alpha_composite(patch, (max(0, x), max(0, y)) if x >= 0 and y >= 0 else (x, y))
+        canvas = Image.alpha_composite(canvas.convert("RGBA"), layer).convert("RGB")
+
+    # ---- 斜向光带 ----
+    band = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw_band = ImageDraw.Draw(band, "RGBA")
+    offset = int(height * 0.28)
+    draw_band.polygon(
+        [
+            (0, offset),
+            (width, offset - int(height * 0.16)),
+            (width, offset - int(height * 0.16) + int(height * 0.045)),
+            (0, offset + int(height * 0.045)),
+        ],
+        fill=(*palette["accent"], 26),
+    )
+    band = band.filter(ImageFilter.GaussianBlur(28))
+    canvas = Image.alpha_composite(canvas.convert("RGBA"), band).convert("RGB")
+
+    # ---- 细网格 + 纵向淡出 ----
+    if style.show_grid:
+        grid = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw_grid = ImageDraw.Draw(grid, "RGBA")
+        step = max(40, width // 16)
+        for x in range(0, width, step):
+            draw_grid.line([(x, 0), (x, height)], fill=(*palette["accent"], 16), width=1)
+        for y in range(0, height, step):
+            draw_grid.line([(0, y), (width, y)], fill=(*palette["accent"], 16), width=1)
+        # 越靠下越淡：把网格乘上一个纵向渐变蒙版
+        fade = _vertical_gradient((width, height), (255, 255, 255), (0, 0, 0)).convert("L")
+        grid.putalpha(ImageChops.multiply(grid.getchannel("A"), fade))
+        canvas = Image.alpha_composite(canvas.convert("RGBA"), grid).convert("RGB")
+
+    # ---- 暗角 ----
+    vignette = ImageChops.invert(glow_mask_base.resize((width, height), Image.BILINEAR))
+    vignette = vignette.point(lambda v: int(v * 0.55))
+    dark = Image.new("RGB", (width, height), (0, 0, 0))
+    canvas = Image.composite(dark, canvas, vignette)
+
+    # ---- 细颗粒，避免大面积纯色显得廉价 ----
+    # 两个注意点：
+    #   1. ImageChops.add(im1, im2, scale) 的结果是 (im1+im2)/scale。
+    #      早先误用 scale=6.0，等于把整图亮度除以 6，封面严重发暗。改用 blend 混合，
+    #      blend 的 alpha 才是「颗粒强度」的正确表达方式。
+    #   2. 不用 Image.effect_noise：它不受我们的随机种子控制，会导致同一标题
+    #      每次生成不同封面。改为用受种子控制的随机字节，在低分辨率生成后放大，
+    #      既完全可复现，又比逐像素生成快得多。
+    grain_w = max(2, width // 4)
+    grain_h = max(2, height // 4)
+    grain_bytes = bytes(rng.getrandbits(8) for _ in range(grain_w * grain_h))
+    grain = Image.frombytes("L", (grain_w, grain_h), grain_bytes).resize(
+        (width, height), Image.BILINEAR
+    )
+    grain_rgb = Image.merge("RGB", (grain, grain, grain))
+    noisy = ImageChops.add(canvas, grain_rgb, scale=1.0, offset=-128)
+    canvas = Image.blend(canvas, noisy, 0.05)
+
+    return canvas
+
+
+def _frame_background(video: Path, style: CoverStyle, frame_at: float, work_dir: Path):
+    """取视频一帧、裁成目标比例、重度模糊作为底图。
+
+    注意：视频开头若为纯黑/纯白帧，出来的就是黑底或白底封面——
+    因此默认不使用，仅在显式配置 cover_background="frame" 时启用。
+    """
     from PIL import Image, ImageFilter
 
-    canvas = Image.new("RGB", (style.width, style.height), THEMES.get(style.theme, THEMES["tech_blue"])["top"])
+    canvas = _vertical_gradient(
+        (style.width, style.height),
+        THEMES.get(style.theme, THEMES["tech_blue"])["top"],
+        THEMES.get(style.theme, THEMES["tech_blue"])["bottom"],
+    ).convert("RGB")
     if video is None or not Path(video).exists():
         return canvas
 
@@ -115,10 +230,9 @@ def _make_background(video: Path, style: CoverStyle, frame_at: float, work_dir: 
         )
         frame = Image.open(frame_path).convert("RGB")
     except Exception as exc:  # noqa: BLE001 - 取帧失败不该阻断封面生成
-        logger.warning("封面底图取帧失败，改用纯渐变：%s", exc)
+        logger.warning("封面底图取帧失败，改用生成式背景：%s", exc)
         return canvas
 
-    # 等比铺满并居中裁剪
     src_ratio = frame.width / frame.height
     dst_ratio = style.width / style.height
     if src_ratio > dst_ratio:
@@ -131,10 +245,7 @@ def _make_background(video: Path, style: CoverStyle, frame_at: float, work_dir: 
     left = (new_w - style.width) // 2
     top = (new_h - style.height) // 2
     frame = frame.crop((left, top, left + style.width, top + style.height))
-
-    # 重度模糊 + 略微降饱和，让前景文字成为唯一焦点
-    frame = frame.filter(ImageFilter.GaussianBlur(style.blur_radius))
-    return frame
+    return frame.filter(ImageFilter.GaussianBlur(style.blur_radius))
 
 
 def _vertical_gradient(size: tuple[int, int], top: tuple[int, int, int], bottom: tuple[int, int, int]):
@@ -222,19 +333,27 @@ def generate_cover(
     title_size = max(24, int(style.title_size * scale))
     tag_size = max(14, int(style.tag_size * scale))
 
-    background = _make_background(video, style, frame_at, work_dir)
+    # 默认使用生成式背景：不依赖视频画面，避免开头是黑/白帧时得到黑底或白底封面
+    from hashlib import sha1
+
+    if style.background == "frame":
+        background = _frame_background(video, style, frame_at, work_dir)
+    else:
+        # 由标题派生随机种子：同一视频稳定，不同视频略有差异
+        seed = int(sha1((title or "").encode("utf-8")).hexdigest()[:8], 16)
+        background = _tech_background(style, seed=seed)
     canvas = Image.new("RGBA", (style.width, style.height), (0, 0, 0, 255))
     canvas.paste(background, (0, 0))
 
-    # 渐变遮罩：颜色随主题，上方稍浅、下方压暗，保证文字区域对比度
-    gradient = _vertical_gradient(
-        (style.width, style.height),
-        (0, 0, 0),
-        (0, 0, 0),
-    ).convert("RGBA")
-    overlay = Image.new("RGBA", (style.width, style.height), (*palette["bottom"], style.overlay_alpha))
-    canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay)
-    canvas = Image.alpha_composite(canvas, gradient.point(lambda v: v))
+    # 仅在使用视频截图作底图时才需要压暗——照片内容不可控，必须拉低亮度保证文字可读。
+    # 生成式背景本身已经是按「文字可读」设计的深色，再压一层会直接把画面涂黑：
+    # 早先无条件叠加一层 alpha=255 的纯色，实测把整图平均亮度从 52 压到 4，
+    # 封面看起来就是一片黑（这正是用户反馈的「黑乎乎」）。
+    if style.background == "frame":
+        overlay = Image.new(
+            "RGBA", (style.width, style.height), (*palette["bottom"], style.overlay_alpha)
+        )
+        canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay)
 
     draw = ImageDraw.Draw(canvas, "RGBA")
 

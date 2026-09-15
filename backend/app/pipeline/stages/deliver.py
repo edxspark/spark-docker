@@ -177,6 +177,7 @@ async def _generate_cover(ctx: StageContext, state: ItemState, title: str, tags:
         theme=str(video_cfg.get("cover_theme", "tech_blue")),
         brand=str(video_cfg.get("cover_brand", "") or ""),
         max_tags=int(video_cfg.get("cover_max_tags", 4)),
+        background=str(video_cfg.get("cover_background", "generated")),
     )
     try:
         await asyncio.to_thread(
