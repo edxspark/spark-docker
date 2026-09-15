@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# App data (runtime artifacts: 下载、成片、字幕、音频、登录态)
+data/*
+!data/.gitkeep
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.secret
+secrets.key
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

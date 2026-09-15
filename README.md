@@ -1,0 +1,244 @@
+# Spark Video Tools · YouTube 视频搬运工作台
+
+输入一个 YouTube 视频 / 合集 / 频道链接，自动完成 **下载 → 英译中 → AI 配音 → 字幕合成 → 发布到抖音** 的全流程，并提供搬运管理（任务进度、历史）与系统配置界面。
+
+```
+YouTube 链接
+   │
+   ├─ 1. 解析链接        yt-dlp 提取信息（单视频 / 合集 / 频道）
+   ├─ 2. 下载            yt-dlp 视频 + 字幕 + 缩略图（优先人工字幕，回退自动字幕）
+   ├─ 3. 字幕清洗断句     合并滚动重复行、去重、按句末标点合并成完整句子
+   ├─ 4. 翻译            DeepSeek 英译中（带上下文、术语表，JSON 输出保证逐句对齐）
+   ├─ 5. 语音合成         阿里云智能语音交互（ISI）逐句 TTS，并发 + 断点续跑
+   ├─ 6. 时间轴对齐       每句严格压进原字幕时间窗（先加速后截断，避免累积漂移）
+   │                     再与原视频背景音按比例混音
+   ├─ 7. 成片渲染         ffmpeg 烧录中文字幕 + 可选竖屏 9:16 转换 + 封面抽取
+   ├─ 8. 文案生成         DeepSeek 生成中文标题与话题标签
+   └─ 9. 发布            Playwright 驱动抖音创作者中心，自动上传并发布
+```
+
+---
+
+## 快速开始
+
+### 依赖
+
+| 组件 | 用途 | 安装 |
+| --- | --- | --- |
+| Python 3.10+ | 后端 | `brew install uv`（本仓库用 uv 管理虚拟环境） |
+| Node 20+ | 前端 | `brew install node` |
+| **ffmpeg / ffprobe** | 媒体处理（必需） | `brew install ffmpeg` |
+| yt-dlp | 下载（已作为 Python 依赖） | 随后端依赖安装 |
+| Playwright + Chromium | 抖音发布（必需） | `pip install playwright && playwright install chromium` |
+
+### 启动
+
+```bash
+# 生产形态：构建前端，后端单端口托管 → http://127.0.0.1:8720
+./scripts/start.sh
+
+# 开发形态：后端热重载 :8720 + Vite dev server :5173 → http://localhost:5173
+./scripts/dev.sh
+```
+
+### 离线自检（不需要任何密钥）
+
+先确认本机环境与整条流水线可用：
+
+```bash
+cd backend && .venv/bin/python ../scripts/verify_pipeline.py
+```
+
+该脚本会用 ffmpeg 生成一段测试视频与英文假字幕，跑完整条流水线（Mock 翻译 / Mock 配音 / Mock 发布），
+输出各阶段明细、成片路径，并抽取两帧便于肉眼检查字幕效果。
+
+### 运行测试
+
+```bash
+cd backend && .venv/bin/python -m pytest tests/ -q
+```
+
+---
+
+## 配置密钥
+
+启动后进入 **系统配置** 页面填写，全部配置加密存储在本机（`data/secrets.key` + SQLite），接口只返回脱敏值。
+
+### 1. 翻译（DeepSeek）
+
+| 项 | 说明 |
+| --- | --- |
+| 翻译服务 | `deepseek`（真实） / `mock`（离线示例） |
+| DeepSeek API Key | 在 [platform.deepseek.com](https://platform.deepseek.com) 创建 |
+| 温度 | 官方建议翻译类任务使用 **1.3** |
+| 术语对照表 | JSON，如 `{"OpenAI":"OpenAI"}`，固定专有名词译法 |
+| 翻译风格提示词 | 直接决定译文的口语化程度，可按频道调性改写 |
+
+### 2. 语音合成（阿里云智能语音交互）
+
+参考官方文档：[语音合成 RESTful API](https://help.aliyun.com/zh/isi/developer-reference/restful-api-3)
+
+| 项 | 说明 |
+| --- | --- |
+| AccessKey ID / Secret | 阿里云 RAM 用户密钥，**建议使用只授予 ISI 权限的子账号** |
+| 项目 AppKey | 智能语音交互控制台「创建项目」后获得 |
+| 手工 Token | 可选。留空则由 AK/SK 自动签发（24 小时有效，进程内自动续期） |
+| 发音人 | 内置常用发音人列表，实际可用性取决于控制台开通情况 |
+| 采样率 | 部分音色仅支持 8000/16000/24000，报错时下调 |
+
+> 单次请求文本上限 **300 字符**，超长句子会按标点自动切分后拼接。
+
+### 3. 下载（yt-dlp）
+
+- **代理**：中国大陆环境访问 YouTube 通常必须配置，例如 `http://127.0.0.1:7890`
+- **Cookies 文件**：遇到需要登录的视频（年龄限制等）时填写 `cookies.txt` 绝对路径
+- **字幕语言**：默认 `en, en-US, en-GB, en-orig`
+
+### 4. 发布（抖音）
+
+参考实现思路来自 [social-auto-upload](https://github.com/dreammis/social-auto-upload)。
+
+- 首次使用需到 **抖音账号** 页面点击「扫码登录」，在弹出的浏览器里用抖音 App 扫码
+- 登录态保存在 `data/auth/douyin_default.json`
+- **真机部署建议**：把 `patchright` 替换 `playwright` 可显著降低自动化特征被识别的概率
+
+### 5. 成片合成
+
+- **画面比例**：抖音推荐 `9:16`，主画面居中、两侧用放大模糊背景填充，避免黑边
+- **保留背景音**：保留原音轨并压低音量作氛围垫底，观感更自然
+- **字幕字体**：留空自动选择系统中可用的中文字体。**注意**：macOS 的 `PingFang SC` 会被 fontconfig 解析到 libass 打不开的 `.ttc`，触发静默字体回退，因此不在候选中
+- **最大加速比**：中文语速慢于英文时会超出原时间窗，允许加速的上限；仍超长则截断该句
+
+---
+
+## 使用流程
+
+1. **新建搬运** → 粘贴链接 → 「解析」确认条目
+2. 合集/频道可选择「全部」或指定起止范围
+3. 设置本次任务的音色、画面比例、是否自动发布、定时发布、话题与简介
+4. 「创建并开始执行」，跳转到任务详情页实时查看进度（WebSocket 推送）
+5. **搬运管理** 中查看所有任务、取消、重试失败项、按任务清理文件
+6. **任务历史** 中检索、复跑、导出 CSV
+
+### 断点续跑
+
+所有阶段产物落盘后即成为续跑依据：
+
+- 已下载的视频、已生成的字幕/配音分段、已渲染的成片都会被跳过
+- **TTS 分段按文件复用**，重试不会重复消耗阿里云额度
+- 服务重启时，进行中的任务会被标记为中断，可安全重试
+
+### 无字幕视频
+
+若视频没有英文字幕，流水线会记录明确日志并**保留原声**，跳过翻译与配音，只做画面比例转换与封面生成。
+
+---
+
+## 项目结构
+
+```
+spark-video-tools/
+├── backend/
+│   ├── app/
+│   │   ├── main.py                  FastAPI 入口（含前端静态托管）
+│   │   ├── models.py                ORM：任务 / 条目 / 日志 / 账号 / 配置
+│   │   ├── schemas.py               接口 DTO
+│   │   ├── api/                     tasks / settings / douyin / stats 路由
+│   │   ├── core/                    config、crypto（密钥加密）、events（事件总线）
+│   │   ├── pipeline/
+│   │   │   ├── runner.py            任务调度、断点续跑、取消
+│   │   │   ├── context.py           阶段上下文与进度上报
+│   │   │   └── stages/              acquire / localize / deliver 三组阶段
+│   │   ├── providers/               downloader / translator / tts / publisher
+│   │   ├── services/                settings_store、subtitles（解析断句）、douyin 登录
+│   │   └── utils/                   ffmpeg 封装、文本工具
+│   ├── tests/                       43 个测试（含离线端到端流水线测试）
+│   └── pyproject.toml
+├── frontend/                        Vue 3 + Vite + TypeScript + Element Plus
+│   └── src/{api,views,components,composables,utils,types}
+├── scripts/
+│   ├── start.sh                     生产形态启动
+│   ├── dev.sh                       开发形态启动
+│   └── verify_pipeline.py           离线端到端自检
+└── data/                            运行期产物（已 gitignore）
+    ├── downloads/   subtitles/   audio/   outputs/   covers/
+    ├── auth/                        抖音登录态
+    └── spark.db  secrets.key
+```
+
+---
+
+## 数据与产物
+
+| 路径 | 内容 |
+| --- | --- |
+| `data/downloads/<任务ID>/<视频ID>/` | 原视频、原字幕、缩略图 |
+| `data/subtitles/<任务ID>/` | 断句后的英文字幕与翻译后的中文字幕 |
+| `data/audio/<任务ID>/<视频ID>/seg_*.mp3` | 逐句配音分段（续跑复用依据） |
+| `data/audio/<任务ID>/<视频ID>/voice_track.mp3` | 对轴后的完整配音轨 |
+| `data/outputs/<任务ID>/<视频ID>.mp4` | 最终成片 |
+| `data/covers/<任务ID>/<视频ID>.jpg` | 发布封面 |
+
+任务详情页可以直接下载每个条目的任意产物。
+
+---
+
+## 已知限制与风险
+
+### 抖音发布
+
+- 抖音**没有面向个人创作者的官方开放 API**，本功能基于创作者中心（`creator.douyin.com`）的浏览器自动化
+- **平台改版会导致选择器失效**。需要更新时，修改
+  `backend/app/providers/publisher/douyin.py` 顶部的 `*_SELECTORS` 常量即可，代码已按「多候选选择器」设计
+- 发布时会尝试在「作品声明」中如实勾选 **「内容由AI生成」**（本流水线含 AI 配音与 AI 字幕）
+- 请控制发布频率（建议单账号每天 3-5 条），并发发布容易触发风控；系统默认对同一账号串行发布
+
+### 版权合规
+
+搬运他人视频存在版权风险。请确认已获得授权，或内容本身符合平台的转载与合理使用规则，建议在作品简介中保留来源信息。
+
+### 音画同步
+
+当前实现是「字幕驱动 + 逐句贴合时间窗」，不做口型对齐。若中文比英文长很多，会先加速（上限可配）再截断，
+可能出现个别句子语速偏快。可通过以下方式改善：调高「语速」、减小「最大加速比」、或改写「翻译风格提示词」让译文更短。
+
+### 人声分离
+
+当前保留原视频整轨作为背景音（人声与背景音乐一起压低）。若要更纯净的效果，可接入 `demucs` 做音源分离，
+只替换人声轨——`providers` 层已预留扩展点。
+
+### Mock 模式
+
+未配置密钥时，翻译与语音合成会走 Mock：
+- Mock 翻译产出 `【示例译文】…` 占位文本
+- Mock 配音产出**等长静音音轨**（用于验证对轴逻辑，不产生费用）
+- Mock 发布不打开浏览器，只生成一条模拟记录
+
+配置真实密钥后自动切换为真实调用，界面与日志中都会明确标注当前处于哪种模式。
+
+---
+
+## 接口一览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/tasks/probe` | 解析链接（不落库） |
+| POST | `/api/tasks` | 创建任务并可选立即执行 |
+| GET | `/api/tasks` | 任务列表（状态、关键词、分页） |
+| GET | `/api/tasks/{id}` | 任务详情（含条目） |
+| GET | `/api/tasks/{id}/logs` | 任务日志 |
+| POST | `/api/tasks/{id}/cancel` | 取消任务 |
+| POST | `/api/tasks/{id}/retry` | 重试（仅失败项 / 全部重跑） |
+| DELETE | `/api/tasks/{id}` | 删除任务（可选删文件） |
+| POST | `/api/tasks/{id}/items/{iid}/publish` | 手动发布某条目 |
+| GET | `/api/tasks/{id}/items/{iid}/file` | 下载产物 |
+| WS | `/api/tasks/{id}/ws` | 实时进度与日志 |
+| GET/PUT | `/api/settings` | 读取（脱敏）/ 保存配置 |
+| POST | `/api/settings/test/{section}` | 分组连通性自检 |
+| GET | `/api/settings/runtime` | 运行环境检查 |
+| GET | `/api/douyin/account` | 账号与登录态 |
+| POST | `/api/douyin/login` | 开始扫码登录 |
+| GET | `/api/douyin/login/status` | 登录进度轮询 |
+| GET | `/api/stats/overview` | 仪表盘统计 |
+
+交互式文档：<http://127.0.0.1:8720/docs>
