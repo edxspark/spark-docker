@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,54 @@ class DownloadCanceled(RuntimeError):
     pass
 
 
+# yt-dlp 会输出 ANSI 颜色码（例如 \x1b[0;31mERROR:\x1b[0m），
+# 直接带进任务日志/界面会显示成乱码，这里统一剥掉。
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text or "").strip()
+
+
+class _ErrorCollector:
+    """收集 yt-dlp 通过 logger 上报的错误/警告。
+
+    必要性：即便 ignoreerrors=False，仍有部分失败路径只写日志而不抛异常
+    （例如分片下载失败、后处理失败）。不收集的话，用户只会看到一句无用的兜底文案。
+    """
+
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+        self.warnings: list[str] = []
+
+    # yt-dlp 的 Logger 协议
+    def debug(self, msg: Any) -> None:
+        text = _strip_ansi(str(msg))
+        # yt-dlp 把普通输出也走 debug，需要过滤掉噪音
+        if text.startswith("[debug] "):
+            return
+
+    def info(self, msg: Any) -> None:
+        return
+
+    def warning(self, msg: Any) -> None:
+        text = _strip_ansi(str(msg))
+        if text and text not in self.warnings:
+            self.warnings.append(text)
+
+    def error(self, msg: Any) -> None:
+        text = _strip_ansi(str(msg))
+        if text and text not in self.errors:
+            self.errors.append(text)
+
+    def summary(self) -> str:
+        if self.errors:
+            return "；".join(self.errors[-3:])
+        if self.warnings:
+            return "；".join(self.warnings[-3:])
+        return ""
+
+
 @dataclass
 class _Progress:
     callback: Any = None
@@ -35,7 +85,10 @@ def _base_opts(config: DownloadConfig) -> dict[str, Any]:
         "no_warnings": True,
         "noprogress": True,
         "nocheckcertificate": True,
-        "ignoreerrors": True,
+        # 不在全局开启 ignoreerrors：单视频下载需要让错误抛出来，
+        # 由流水线按条目粒度记录并展示真实原因。合集里单个视频失败不会影响其他条目，
+        # 因为每个条目都是独立的一次下载调用。
+        "ignoreerrors": False,
         "retries": config.retries,
         "fragment_retries": config.retries,
         "socket_timeout": 30,
@@ -59,18 +112,56 @@ _NETWORK_HINT = (
     "（例如 http://127.0.0.1:7890）；若视频需要登录，请配置 cookies 文件。"
 )
 
+# 判定「瞬时网络故障」的关键词：命中才值得重试
+_TRANSIENT_MARKERS = (
+    "timed out",
+    "timeout",
+    "connection",
+    "getaddrinfo",
+    "tunnel",
+    "ssl",
+    "giving up after",
+    "unable to download",
+    "read error",
+    "temporary failure",
+)
 
-def _friendly_error(exc: Exception, url: str = "") -> str:
+
+def _looks_transient(summary: str) -> bool:
+    lowered = (summary or "").lower()
+    return any(marker in lowered for marker in _TRANSIENT_MARKERS)
+
+
+def _friendly_error(exc: Exception, url: str = "", action: str = "解析链接") -> str:
     """把 yt-dlp 的原始报错翻译成用户能照做的提示。"""
-    text = str(exc)
+    text = _strip_ansi(str(exc))
     lowered = text.lower()
-    if any(key in lowered for key in ("timed out", "timeout", "urlopen error", "connection", "getaddrinfo", "tunnel", "ssl")):
-        return f"解析链接失败：{_NETWORK_HINT}（原始错误：{text[:300]}）"
+    if any(
+        key in lowered
+        for key in ("timed out", "timeout", "urlopen error", "connection", "getaddrinfo", "tunnel", "ssl", "giving up after")
+    ):
+        return f"{action}失败：{_NETWORK_HINT}（原始错误：{text[:300]}）"
     if "sign in" in lowered or "confirm your age" in lowered or "private video" in lowered:
-        return f"解析链接失败：该视频需要登录，请在「系统配置 → 下载」中配置 cookies 文件。（原始错误：{text[:300]}）"
-    if "unsupported url" in lowered:
-        return f"解析链接失败：不支持的链接格式：{url[:200]}"
-    return f"解析链接失败：{text[:400]}"
+        return (
+            f"{action}失败：该视频需要登录，请在「系统配置 → 下载」中配置 cookies 文件。"
+            f"（原始错误：{text[:300]}）"
+        )
+    if "unsupported url" in lowered or "is not a valid url" in lowered:
+        return f"{action}失败：不支持的链接格式：{url[:200]}"
+    if "requested format is not available" in lowered or "no video formats found" in lowered:
+        return (
+            f"{action}失败：没有符合当前格式表达式的清晰度可用。"
+            "请在「系统配置 → 下载」中把 yt-dlp 格式改回默认值或下调最大分辨率。"
+            f"（原始错误：{text[:300]}）"
+        )
+    if "ffmpeg" in lowered:
+        return f"{action}失败：需要 ffmpeg 合并音视频但未找到，请执行 brew install ffmpeg。（原始错误：{text[:300]}）"
+    if "http error 403" in lowered or "forbidden" in lowered:
+        return (
+            f"{action}失败：被 YouTube 拒绝（403）。常见原因是 IP 被限流或需要登录，"
+            f"可尝试配置代理或 cookies 文件后重试。（原始错误：{text[:300]}）"
+        )
+    return f"{action}失败：{text[:400] or 'yt-dlp 未返回任何错误信息'}"
 
 
 def _probe_sync(url: str, config: DownloadConfig) -> ProbeResult:
@@ -128,6 +219,18 @@ def _probe_sync(url: str, config: DownloadConfig) -> ProbeResult:
     )
 
 
+def _find_video(directory: Path, video_id: str) -> Path | None:
+    """在下载目录中找出已完成的视频文件。"""
+    candidates = [
+        p
+        for p in directory.glob(f"{video_id}.*")
+        if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"} and not p.name.endswith(".part")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_size)
+
+
 def _find_subtitle(directory: Path, video_id: str, langs: list[str]) -> Path | None:
     """在下载目录里找出该视频最合适的字幕文件。"""
     candidates: list[Path] = []
@@ -181,49 +284,72 @@ def _download_sync(
         "format": config.format,
         "merge_output_format": "mp4",
         "writethumbnail": config.write_thumbnail,
-        "postprocessors": [],
     }
 
     subtitle_langs = config.subtitle_langs or ["en"]
 
-    def attempt(*, manual: bool) -> Path | None:
+    def attempt(*, manual: bool) -> tuple[Path | None, str]:
+        """下载视频（顺带取字幕）。返回 (字幕路径, 错误摘要)。"""
+        collector = _ErrorCollector()
         opts = dict(common)
+        opts["logger"] = collector
         opts["writesubtitles"] = manual
         opts["writeautomaticsub"] = not manual
         opts["subtitleslangs"] = subtitle_langs
         opts["subtitlesformat"] = "srt/best"
         opts["convertsubtitles"] = "srt"
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-        return _find_subtitle(output_dir, item.video_id, subtitle_langs)
+        retcode = 0
+        raised: Exception | None = None
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                retcode = ydl.download([url]) or 0
+        except DownloadCanceled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raised = exc
+        summary = collector.summary() or (str(raised) if raised else "")
+        if not summary and retcode not in (0, None):
+            summary = f"yt-dlp 返回非零状态码 {retcode}，但未提供具体原因"
+        return _find_subtitle(output_dir, item.video_id, subtitle_langs), summary
 
     subtitle_path: Path | None = None
     subtitle_kind = "none"
     order = [True, False] if config.prefer_manual_subtitle else [False, True]
-    last_error: Exception | None = None
-    for manual in order:
-        try:
-            subtitle_path = attempt(manual=manual)
-        except DownloadCanceled:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            logger.warning("字幕下载失败（manual=%s）：%s", manual, exc)
-            continue
-        if subtitle_path:
-            subtitle_kind = "manual" if manual else "auto"
-            break
+    errors: list[str] = []
 
-    video_files = sorted(
-        (p for p in output_dir.glob(f"{item.video_id}.*") if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}),
-        key=lambda p: p.stat().st_size,
-        reverse=True,
-    )
-    if not video_files:
-        raise ProviderError(
-            f"视频下载失败：未找到输出文件（{last_error or '可能视频不可用、需要登录或存在地区限制'}）"
-        )
-    video_path = video_files[0]
+    # 直连 YouTube 时常出现瞬时超时（探测成功、下载时又超时）。yt-dlp 内部已按
+    # config.retries 重试过，这里只额外补一轮：仅在错误看起来是网络问题时重试，
+    # 避免在确定性的失败（格式不可用、需要登录等）上反复等待。
+    max_rounds = 2
+    for round_index in range(max_rounds):
+        if _find_video(output_dir, item.video_id):
+            break
+        for manual in order:
+            try:
+                subtitle_path, error_summary = attempt(manual=manual)
+            except DownloadCanceled:
+                raise
+            if error_summary:
+                errors.append(error_summary)
+                logger.warning("下载尝试失败（第 %s 轮, manual=%s）：%s", round_index + 1, manual, error_summary)
+            if subtitle_path:
+                subtitle_kind = "manual" if manual else "auto"
+                break
+            # 视频已下载成功时不必再试第二种字幕模式
+            if _find_video(output_dir, item.video_id):
+                break
+        if _find_video(output_dir, item.video_id):
+            break
+        if round_index >= max_rounds - 1 or not _looks_transient(errors[-1] if errors else ""):
+            break
+        wait = 5 * (round_index + 1)
+        logger.info("下载失败疑似瞬时网络问题，%s 秒后重试（第 %s/%s 轮）", wait, round_index + 2, max_rounds)
+        time.sleep(wait)
+
+    video_path = _find_video(output_dir, item.video_id)
+    if video_path is None:
+        reason = errors[-1] if errors else "yt-dlp 未返回任何错误信息，可能是输出目录权限问题"
+        raise ProviderError(_friendly_error(RuntimeError(reason), url, action="下载视频"))
 
     thumbnail_path = next(
         (p for p in output_dir.glob(f"{item.video_id}.*") if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}),
