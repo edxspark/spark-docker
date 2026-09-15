@@ -65,9 +65,14 @@ class CoverStyle:
     tag_size: int = 30
     brand: str = "AI 译制"
     max_tags: int = 4
-    # 底图来源：generated 为程序化科技背景（默认，不依赖视频画面）；
-    # frame 为视频截图（开头是黑/白帧时会得到黑底或白底封面）
+    # 底图来源：generated 为程序化科技背景；frame 为视频截图
+    # （开头是黑/白帧时会得到黑底或白底封面）
     background: str = "generated"
+    # 封面来源：thumbnail 用视频原始缩略图（推荐，创作者设计过的封面图）；
+    # generated 用程序生成的设计稿；frame 从成片抽帧
+    source: str = "thumbnail"
+    # 用缩略图时是否叠加标题与标签。缩略图本身通常已含文字，默认不叠加避免重复。
+    overlay_text_on_thumbnail: bool = False
     show_grid: bool = True
     blur_radius: int = 42
     overlay_alpha: int = 205
@@ -89,6 +94,110 @@ def _load_font(size: int):
     from PIL import ImageFont
 
     return ImageFont.load_default()
+
+
+def best_thumbnail_url(url: str) -> str:
+    """把 YouTube 缩略图换成最高清版本。
+
+    yt-dlp 有时只给 hqdefault（480x360），而同一张图通常有 maxresdefault
+    （1280x720）。用作封面时清晰度差别肉眼可见，因此统一升级到最高清。
+    """
+    if not url:
+        return ""
+    for low in ("hqdefault", "mqdefault", "sddefault", "default"):
+        if f"/{low}." in url:
+            return url.replace(f"/{low}.", "/maxresdefault.")
+    return url
+
+
+async def fetch_thumbnail_bytes(url: str, local_file: Path | None = None) -> bytes | None:
+    """取缩略图数据：优先最高清远程图，失败再退回本地已下载的文件。"""
+    import httpx
+
+    candidates: list[str] = []
+    upgraded = best_thumbnail_url(url)
+    if upgraded:
+        candidates.append(upgraded)
+    if url and url != upgraded:
+        candidates.append(url)
+
+    for candidate in candidates:
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                response = await client.get(candidate)
+            if response.status_code == 200 and len(response.content) > 5000:
+                return response.content
+        except Exception as exc:  # noqa: BLE001 - 逐级回退
+            logger.warning("缩略图下载失败（%s）：%s", candidate[:60], exc)
+
+    if local_file and Path(local_file).exists():
+        try:
+            return Path(local_file).read_bytes()
+        except OSError as exc:
+            logger.warning("本地缩略图读取失败：%s", exc)
+    return None
+
+
+def _fit_image(img, style: CoverStyle):
+    """把图片放进目标画幅。
+
+    比例一致时直接缩放；不一致时「完整显示 + 模糊铺满背景」，
+    避免把创作者精心设计的封面裁掉关键信息（标题通常压在边角）。
+    """
+    from PIL import Image, ImageFilter
+
+    width, height = style.width, style.height
+    src_ratio = img.width / img.height
+    dst_ratio = width / height
+
+    if abs(src_ratio - dst_ratio) < 0.03:
+        return img.resize((width, height), Image.LANCZOS)
+
+    # 背景：原图铺满 + 重度模糊 + 压暗
+    if src_ratio > dst_ratio:
+        bg_h = width
+        bg_w = int(bg_h * src_ratio)
+    else:
+        bg_w = height
+        bg_h = int(bg_w / src_ratio)
+    background = img.resize((max(2, bg_w), max(2, bg_h)), Image.LANCZOS)
+    left = (background.width - width) // 2
+    top = (background.height - height) // 2
+    background = background.crop((left, top, left + width, top + height))
+    background = background.filter(ImageFilter.GaussianBlur(48))
+    background = Image.blend(background, Image.new("RGB", background.size, (8, 10, 16)), 0.45)
+
+    # 前景：完整等比缩放到目标内
+    if src_ratio > dst_ratio:
+        fg_w = width
+        fg_h = max(1, int(width / src_ratio))
+    else:
+        fg_h = height
+        fg_w = max(1, int(height * src_ratio))
+    foreground = img.resize((fg_w, fg_h), Image.LANCZOS)
+
+    canvas = background.copy()
+    canvas.paste(foreground, ((width - fg_w) // 2, (height - fg_h) // 2))
+    return canvas
+
+
+def build_thumbnail_cover(data: bytes, style: CoverStyle, out_path: Path) -> Path:
+    """用视频原始缩略图生成封面。
+
+    原视频封面由创作者设计，用于吸引点击，通常比程序生成的更好看，
+    因此默认优先使用它。
+    """
+    import io
+
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(data))
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    canvas = _fit_image(img, style)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.convert("RGB").save(out_path, "JPEG", quality=92)
+    return out_path
 
 
 def _tech_background(style: CoverStyle, *, seed: int = 0):

@@ -158,6 +158,11 @@ class VideoConfig(BaseModel):
     # 封面来源：
     #   generated —— 用视频帧做底图，叠加深色渐变并排版标题与标签（推荐）
     #   frame     —— 直接抽一帧，不做任何设计
+    # 封面来源：
+    #   thumbnail —— 使用视频原始缩略图（默认。创作者为吸引点击专门设计，通常最好看）
+    #   generated —— 程序生成的科技风设计稿
+    #   frame     —— 从成片抽一帧
+    cover_source: Literal["thumbnail", "generated", "frame"] = "thumbnail"
     cover_mode: Literal["generated", "frame"] = "generated"
     cover_theme: Literal["tech_blue", "tech_dark", "minimal"] = "tech_blue"
     # 封面底图：generated 为程序化生成的科技背景（推荐，不受视频内容影响）；

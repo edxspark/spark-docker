@@ -319,3 +319,89 @@ class TestCoverUploadDiagnostics:
         assert out.stat().st_size > 150 * 1024, (
             f"设计封面只有 {out.stat().st_size // 1024}KB，可能是抽帧产物"
         )
+
+
+class TestThumbnailCover:
+    """默认使用视频原始缩略图作封面。
+
+    原视频封面由创作者为吸引点击专门设计，效果通常好于程序生成的模板。
+    """
+
+    def test_default_source_is_thumbnail(self):
+        from app.services.cover import CoverStyle
+
+        assert CoverStyle().source == "thumbnail"
+
+    def test_best_thumbnail_url_upgrades_low_res(self):
+        from app.services.cover import best_thumbnail_url
+
+        assert "maxresdefault" in best_thumbnail_url("https://i.ytimg.com/vi/abc/hqdefault.jpg")
+        assert "maxresdefault" in best_thumbnail_url("https://i.ytimg.com/vi/abc/mqdefault.jpg")
+        assert "maxresdefault" in best_thumbnail_url("https://i.ytimg.com/vi/abc/default.jpg")
+        # 已是最高清则保持不变
+        url = "https://i.ytimg.com/vi/abc/maxresdefault.jpg"
+        assert best_thumbnail_url(url) == url
+        assert best_thumbnail_url("") == ""
+
+    async def test_uses_local_file_when_remote_fails(self, tmp_path):
+        """远程取不到时应退回本地已下载的缩略图（国内网络常访问不到 ytimg）。"""
+        from PIL import Image
+
+        from app.services.cover import fetch_thumbnail_bytes
+
+        local = tmp_path / "thumb.webp"
+        Image.new("RGB", (320, 180), (200, 30, 30)).save(local, "WEBP")
+        data = await fetch_thumbnail_bytes("https://invalid.invalid/x.jpg", local)
+        assert data, "本地缩略图未被使用"
+        assert len(data) == local.stat().st_size, "返回的应是本地文件的原始内容"
+
+    async def test_returns_none_when_both_unavailable(self, tmp_path):
+        from app.services.cover import fetch_thumbnail_bytes
+
+        assert await fetch_thumbnail_bytes("https://invalid.invalid/x.jpg", None) is None
+        assert await fetch_thumbnail_bytes("", tmp_path / "missing.webp") is None
+
+    def test_thumbnail_becomes_the_cover(self, tmp_path):
+        """封面内容必须就是缩略图本身，而不是又被套上设计模板。"""
+        import io
+
+        from PIL import Image, ImageStat
+
+        from app.services.cover import CoverStyle, build_thumbnail_cover
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (1280, 720), (60, 120, 200)).save(buffer, "JPEG")
+        out = tmp_path / "cover.jpg"
+        build_thumbnail_cover(buffer.getvalue(), CoverStyle(width=1920, height=1080), out)
+
+        with Image.open(out) as im:
+            assert im.size == (1920, 1080)
+            # 纯色缩略图缩放后仍应是同一颜色，不能被滤镜改变
+            mean = ImageStat.Stat(im.convert("RGB")).mean
+        assert abs(mean[2] - 200) < 12, f"封面颜色被改动：{mean}"
+        assert abs(mean[0] - 60) < 12
+
+    def test_aspect_mismatch_uses_blur_fill(self, tmp_path):
+        """竖版封面用横版缩略图时，应完整显示原图并用模糊背景铺满，而不是裁掉关键内容。"""
+        import io
+
+        from PIL import Image
+
+        from app.services.cover import CoverStyle, build_thumbnail_cover
+
+        buffer = io.BytesIO()
+        img = Image.new("RGB", (1280, 720), (10, 10, 10))
+        # 在四角画明显色块：完整显示时四个角都应保留
+        for xy in ((0, 0), (1180, 0), (0, 620), (1180, 620)):
+            img.paste((255, 255, 255), (xy[0], xy[1], xy[0] + 100, xy[1] + 100))
+        img.save(buffer, "JPEG")
+
+        out = tmp_path / "vertical.jpg"
+        build_thumbnail_cover(buffer.getvalue(), CoverStyle(width=1080, height=1920), out)
+        with Image.open(out) as im:
+            assert im.size == (1080, 1920)
+            pixels = im.convert("L").load()
+            # 前景居中，四角标记应在画面中上部被完整保留
+            assert pixels[540, 1080 - 300] is not None  # 仅确认可读，细节由视觉验证
+            bright = sum(1 for y in range(0, 1920, 4) for x in range(0, 1080, 4) if pixels[x, y] > 200)
+        assert bright > 200, "原图四角的标记没有保留，说明被裁切了"

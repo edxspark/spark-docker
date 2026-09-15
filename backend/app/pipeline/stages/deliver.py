@@ -147,30 +147,86 @@ async def stage_publish(ctx: StageContext, state: ItemState) -> None:
 async def _generate_cover(ctx: StageContext, state: ItemState, title: str, tags: list[str]) -> None:
     """生成发布用封面。
 
-    放在 metadata 阶段而不是 align 阶段：中文标题与话题标签是在这里才产出的，
-    而封面需要把它们排上去（早于此阶段只有原始英文标题）。
+    默认直接使用视频原始缩略图：它是创作者为吸引点击专门设计的，
+    效果通常好于程序生成的模板。取不到缩略图时才退回生成式设计稿。
+
+    放在 metadata 阶段而不是 align：中文标题与话题标签是在这里才产出的，
+    生成式封面（以及失败回退）需要用到它们。
     """
     video_cfg = ctx.config.merged("video")
-    mode = str(video_cfg.get("cover_mode", "generated"))
+    source_mode = str(video_cfg.get("cover_source", "thumbnail"))
+    target_aspect = str(video_cfg.get("target_aspect", "original"))
+    media = None
+    video_file = state.paths.output if state.paths.output.exists() else state.paths.video
+    if video_file.exists():
+        try:
+            media = await ffmpeg_utils.probe(video_file)
+        except Exception:  # noqa: BLE001
+            media = None
+    width, height = cover_mod.cover_size_for(
+        target_aspect, media.width if media else 0, media.height if media else 0
+    )
 
-    # 底图用成片（已烧好字幕），抽帧位置取偏前的位置，通常画面更稳
-    source = state.paths.output if state.paths.output.exists() else state.paths.video
+    # 1) 优先使用视频原始缩略图
+    if source_mode == "thumbnail":
+        local_thumb = None
+        try:
+            candidates = [
+                p
+                for p in state.paths.video_dir.glob(f"{state.item.video_id}.*")
+                if p.suffix.lower() in {".webp", ".jpg", ".jpeg", ".png"}
+            ]
+            if candidates:
+                local_thumb = max(candidates, key=lambda p: p.stat().st_size)
+        except Exception:  # noqa: BLE001
+            local_thumb = None
+
+        data = await cover_mod.fetch_thumbnail_bytes(state.item.thumbnail or "", local_thumb)
+        if data:
+            try:
+                await asyncio.to_thread(
+                    cover_mod.build_thumbnail_cover,
+                    data,
+                    cover_mod.CoverStyle(width=width, height=height),
+                    state.paths.cover,
+                )
+                state.stats["cover"] = {
+                    "mode": "thumbnail",
+                    "size": f"{width}x{height}",
+                    "source_url": cover_mod.best_thumbnail_url(state.item.thumbnail or "")[:200],
+                }
+                await ctx.reporter.item_update(
+                    state.item.id,
+                    cover_path=ctx.relative(state.paths.cover),
+                    stats={**state.item.stats, **state.stats},
+                )
+                await ctx.reporter.log(
+                    f"已使用视频原始缩略图作为封面：{width}x{height}", stage="metadata", item_id=state.item.id
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                await ctx.reporter.log(
+                    f"缩略图封面生成失败，改用设计封面：{exc}",
+                    level="warning", stage="metadata", item_id=state.item.id,
+                )
+
+    # 2) 程序生成的科技风设计稿
+    source = video_file
     if not source.exists():
         return
 
-    if mode != "generated":
-        # 退化为直接抽一帧
+    if source_mode == "frame":
         try:
             await ffmpeg_utils.extract_cover(source, state.paths.cover, at=1.0)
-            await ctx.reporter.item_update(state.item.id, cover_path=ctx.relative(state.paths.cover))
+            state.stats["cover"] = {"mode": "frame", "size": f"{width}x{height}"}
+            await ctx.reporter.item_update(
+                state.item.id, cover_path=ctx.relative(state.paths.cover),
+                stats={**state.item.stats, **state.stats},
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("封面抽取失败：%s", exc)
         return
 
-    media = await ffmpeg_utils.probe(source)
-    width, height = cover_mod.cover_size_for(
-        str(video_cfg.get("target_aspect", "original")), media.width, media.height
-    )
     style = cover_mod.CoverStyle(
         width=width,
         height=height,
@@ -178,6 +234,7 @@ async def _generate_cover(ctx: StageContext, state: ItemState, title: str, tags:
         brand=str(video_cfg.get("cover_brand", "") or ""),
         max_tags=int(video_cfg.get("cover_max_tags", 4)),
         background=str(video_cfg.get("cover_background", "generated")),
+        source=source_mode,
     )
     try:
         await asyncio.to_thread(
@@ -187,7 +244,7 @@ async def _generate_cover(ctx: StageContext, state: ItemState, title: str, tags:
             tags=list(state.item.tags or tags),
             out_path=state.paths.cover,
             style=style,
-            frame_at=min(1.0, max(0.1, media.duration / 10)),
+            frame_at=min(1.0, max(0.1, (media.duration if media else 12) / 10)),
             work_dir=state.paths.work_dir / "cover",
         )
     except Exception as exc:  # noqa: BLE001 - 封面失败不应影响发布主流程
@@ -199,13 +256,12 @@ async def _generate_cover(ctx: StageContext, state: ItemState, title: str, tags:
         except Exception:  # noqa: BLE001
             return
 
-    state.stats["cover"] = {"mode": mode, "size": f"{width}x{height}",
+    state.stats["cover"] = {"mode": "generated", "size": f"{width}x{height}",
                             "theme": video_cfg.get("cover_theme", "tech_blue")}
     await ctx.reporter.item_update(
         state.item.id, cover_path=ctx.relative(state.paths.cover), stats={**state.item.stats, **state.stats}
     )
     await ctx.reporter.log(
-        f"已生成封面：{width}x{height}，含标题与 {len(state.item.tags or tags)} 个标签",
-        stage="metadata",
-        item_id=state.item.id,
+        f"已生成设计封面：{width}x{height}，含标题与 {len(state.item.tags or tags)} 个标签",
+        stage="metadata", item_id=state.item.id,
     )
