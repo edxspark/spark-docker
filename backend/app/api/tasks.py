@@ -80,10 +80,21 @@ async def probe_url(
                 author=e.author,
                 duration=e.duration,
                 thumbnail=e.thumbnail,
+                upload_date=e.upload_date,
+                view_count=e.view_count,
             )
             for e in result.entries
         ],
     )
+
+
+def _describe_selection(probe_total: int, entries: list) -> str:
+    """把「用户挑了多少条」写成日志里能看懂的一句话。"""
+    if len(entries) >= probe_total:
+        return f"共 {len(entries)} 个视频（全部）"
+    if probe_total > 0 and len(entries) == 1:
+        return f"已挑选 1 个视频（合集共 {probe_total} 个）"
+    return f"已挑选 {len(entries)} 个视频（合集共 {probe_total} 个）"
 
 
 @router.post("", response_model=TaskDetailOut, status_code=201)
@@ -102,11 +113,36 @@ async def create_task(
     if not probe.entries:
         raise HTTPException(status_code=400, detail="未解析到任何视频，请检查链接")
 
+    probe_total = len(probe.entries)
     entries = probe.entries
-    start = max(0, payload.start_index - 1)
-    entries = entries[start:]
-    if payload.max_items:
-        entries = entries[: payload.max_items]
+    if payload.selected_video_ids is not None:
+        # 前端合集弹窗的勾选结果：按用户勾选的顺序建立条目（避免用户看到的列表
+        # 与最终任务条目不一致）。"all" 是弹窗里「全选」的显式确认标记。
+        wanted = [str(v).strip() for v in payload.selected_video_ids if str(v).strip()]
+        if "all" in wanted:
+            entries = list(probe.entries)
+        else:
+            by_id: dict[str, list] = {}
+            for entry in probe.entries:
+                by_id.setdefault(entry.video_id, []).append(entry)
+            picked: list = []
+            for video_id in wanted:
+                bucket = by_id.get(video_id)
+                if bucket:
+                    picked.append(bucket.pop(0))
+            if not picked:
+                raise HTTPException(
+                    status_code=400,
+                    detail="勾选的视频都不在本次解析结果中，请重新解析链接后再选择",
+                )
+            entries = picked
+    else:
+        start = max(0, payload.start_index - 1)
+        entries = entries[start:]
+        if payload.max_items:
+            entries = entries[: payload.max_items]
+
+    selection_note = _describe_selection(probe_total, entries)
 
     task = Task(
         title=(payload.title or truncate(probe.title or "未命名搬运任务", 200)),
@@ -145,7 +181,7 @@ async def create_task(
         TaskLog(
             task_id=task.id,
             stage="probe",
-            message=f"已解析 {probe.source_type}，共 {len(entries)} 个视频",
+            message=f"已解析 {probe.source_type}：{selection_note}",
         )
     )
     await session.commit()

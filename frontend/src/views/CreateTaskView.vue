@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { settingsApi, taskApi } from '@/api'
-import type { CreateTaskPayload, ProbeResponse, TaskOptions, Voice } from '@/types'
+import CollectionPicker from '@/components/CollectionPicker.vue'
+import type { CreateTaskPayload, ProbeEntry, ProbeResponse, TaskOptions, Voice } from '@/types'
 import { formatDuration, formatNumber, shortUrl } from '@/utils/format'
 
 const router = useRouter()
@@ -14,21 +15,26 @@ const probing = ref(false)
 const creating = ref(false)
 const probe = ref<ProbeResponse | null>(null)
 
+/** 合集/频道弹窗：必须先勾选确认，才允许创建任务 */
+const pickerVisible = ref(false)
+const selectionConfirmed = ref(false)
+const selectedIds = ref<string[]>([])
+/** 最近一次解析成功的链接，用于判断用户是否改动了输入 */
+const probedUrl = ref('')
+
 const voices = ref<Voice[]>([])
 const defaultsLoaded = ref(false)
 
 const form = reactive({
   title: '',
-  selectionMode: 'all' as 'all' | 'range',
-  startIndex: 1,
-  maxItems: 0,
   voice: '',
   autoPublish: true,
   publishMode: 'immediate' as 'immediate' | 'scheduled',
   scheduleOffset: 60,
   targetAspect: 'original' as 'original' | '9:16' | '16:9',
   burnSubtitles: true,
-  keepBgm: true,
+  originalAudio: 'remove' as 'remove' | 'keep',
+  subtitleMode: 'bilingual' as 'bilingual' | 'zh' | 'en',
   bgmVolume: 0.12,
   description: '',
   tags: [] as string[],
@@ -37,26 +43,25 @@ const form = reactive({
 const isPlaylist = computed(() => (probe.value?.total ?? 0) > 1)
 const entries = computed(() => probe.value?.entries || [])
 
-const previewEntries = computed(() => {
+/** 勾选后的条目（单视频恒为该视频本身） */
+const selectedEntries = computed(() => {
+  if (!probe.value) return [] as ProbeEntry[]
   if (!isPlaylist.value) return entries.value
-  let list = entries.value
-  if (form.selectionMode === 'range') {
-    list = list.slice(Math.max(0, form.startIndex - 1))
-    if (form.maxItems > 0) list = list.slice(0, form.maxItems)
-  }
-  return list.slice(0, 50)
+  if (selectedIds.value.includes('all')) return entries.value
+  const wanted = new Set(selectedIds.value)
+  return entries.value.filter((e) => wanted.has(e.video_id))
 })
 
-const willProcessCount = computed(() => {
-  if (!probe.value) return 0
-  if (!isPlaylist.value) return entries.value.length
-  if (form.selectionMode === 'all') return entries.value.length
-  const start = Math.max(0, form.startIndex - 1)
-  const rest = entries.value.slice(start)
-  return form.maxItems > 0 ? Math.min(form.maxItems, rest.length) : rest.length
+const willProcessCount = computed(() => selectedEntries.value.length)
+const selectedDuration = computed(() => selectedEntries.value.reduce((sum, e) => sum + (e.duration || 0), 0))
+const selectionReady = computed(() => !isPlaylist.value || selectionConfirmed.value)
+const previewEntries = computed(() => selectedEntries.value.slice(0, 50))
+const selectionHint = computed(() => {
+  if (!isPlaylist.value) return ''
+  if (!selectionConfirmed.value) return '尚未确认搬运范围'
+  if (selectedEntries.value.length === entries.value.length) return `已确认全部 ${entries.value.length} 个视频`
+  return `已从 ${entries.value.length} 个视频中勾选 ${selectedEntries.value.length} 个`
 })
-
-const totalDuration = computed(() => previewEntries.value.reduce((sum, e) => sum + (e.duration || 0), 0))
 
 async function loadDefaults() {
   try {
@@ -69,7 +74,8 @@ async function loadDefaults() {
     form.autoPublish = data.config.publish?.auto_publish ?? true
     form.targetAspect = (data.config.video?.target_aspect as any) || 'original'
     form.burnSubtitles = data.config.video?.burn_subtitles ?? true
-    form.keepBgm = data.config.video?.keep_bgm ?? true
+    form.originalAudio = (data.config.video?.original_audio as 'remove' | 'keep') ?? 'remove'
+    form.subtitleMode = (data.config.video?.subtitle_mode as 'bilingual' | 'zh' | 'en') ?? 'bilingual'
     form.bgmVolume = data.config.video?.bgm_volume ?? 0.12
     form.tags = [...(data.config.publish?.default_tags || [])]
     const offset = data.config.publish?.schedule_offset_minutes || 0
@@ -94,12 +100,19 @@ async function handleProbe() {
   try {
     const result = await taskApi.probe(target)
     probe.value = result
+    probedUrl.value = target
     form.title = result.title || ''
     if (result.entries[0]?.author && !form.title) form.title = result.entries[0].author
+    selectedIds.value = []
+    selectionConfirmed.value = false
     step.value = 1
-    ElMessage.success(
-      result.total > 1 ? `解析到 ${result.total} 个视频` : '解析成功，已获取视频信息',
-    )
+    if (result.total > 1) {
+      // 合集/频道：先弹列表让用户确认要搬运哪些视频，不直接建任务
+      pickerVisible.value = true
+      ElMessage.success(`解析到 ${result.total} 个视频，请先确认要搬运的条目`)
+    } else {
+      ElMessage.success('解析成功，已获取视频信息')
+    }
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
@@ -107,12 +120,25 @@ async function handleProbe() {
   }
 }
 
+function openPicker() {
+  pickerVisible.value = true
+}
+
+function handlePickerConfirm(videoIds: string[]) {
+  selectedIds.value = [...videoIds]
+  selectionConfirmed.value = true
+  pickerVisible.value = false
+  const count = videoIds.includes('all') ? entries.value.length : videoIds.length
+  ElMessage.success(`已确认搬运 ${count} 个视频`)
+}
+
 function buildOptions(): TaskOptions {
   const options: TaskOptions = {
     auto_publish: form.autoPublish,
     target_aspect: form.targetAspect,
     burn_subtitles: form.burnSubtitles,
-    keep_bgm: form.keepBgm,
+    original_audio: form.originalAudio,
+    subtitle_mode: form.subtitleMode,
     bgm_volume: form.bgmVolume,
   }
   if (form.voice) options.voice = form.voice
@@ -128,6 +154,16 @@ function buildOptions(): TaskOptions {
 
 async function handleCreate(autoStart: boolean) {
   if (!probe.value) return
+  if (!selectionReady.value) {
+    ElMessage.warning('这是合集链接，请先在列表中确认要搬运的视频')
+    openPicker()
+    return
+  }
+  if (!willProcessCount.value) {
+    ElMessage.warning('至少选择 1 个视频')
+    openPicker()
+    return
+  }
   creating.value = true
   try {
     const payload: CreateTaskPayload = {
@@ -136,9 +172,8 @@ async function handleCreate(autoStart: boolean) {
       auto_start: autoStart,
       options: buildOptions(),
     }
-    if (isPlaylist.value && form.selectionMode === 'range') {
-      payload.start_index = Math.max(1, form.startIndex)
-      payload.max_items = form.maxItems > 0 ? form.maxItems : null
+    if (isPlaylist.value) {
+      payload.selected_video_ids = [...selectedIds.value]
     }
     const task = await taskApi.create(payload)
     ElMessage.success(
@@ -158,7 +193,19 @@ function reset() {
   step.value = 0
   probe.value = null
   url.value = ''
+  selectedIds.value = []
+  selectionConfirmed.value = false
+  pickerVisible.value = false
 }
+
+// 链接被改动后，之前的勾选结果不再对应当前输入，必须重新解析确认
+watch(url, () => {
+  if (!selectionConfirmed.value) return
+  if (url.value.trim() !== probedUrl.value) {
+    selectionConfirmed.value = false
+    selectedIds.value = []
+  }
+})
 
 onMounted(() => {
   loadDefaults()
@@ -215,23 +262,30 @@ onMounted(() => {
 
     <!-- Step 1 -->
     <template v-if="probe">
+      <div v-if="isPlaylist && !selectionReady" class="panel picker-gate">
+        <div class="gate-icon"><el-icon><WarningFilled /></el-icon></div>
+        <div class="gate-body">
+          <div class="gate-title">这是{{ probe.source_type === 'channel' ? '频道' : '合集' }}链接（共 {{ probe.total }} 个视频）</div>
+          <p class="muted gate-desc">
+            为避免一次性创建大量任务，请先在合集列表中勾选要搬运的视频，确认后才会建立任务。
+          </p>
+        </div>
+        <el-button type="primary" size="large" :icon="'List'" @click="openPicker">打开合集列表选择</el-button>
+      </div>
+
+      <template v-else>
       <div class="panel">
         <div class="panel-title">
           <span>第二步 · 搬运范围</span>
-          <span class="muted">将处理 {{ willProcessCount }} 个视频，预计原片总时长 {{ formatDuration(totalDuration) }}</span>
+          <span class="muted">
+            将处理 {{ willProcessCount }} 个视频，预计原片总时长 {{ formatDuration(selectedDuration) }}
+          </span>
         </div>
 
-        <el-radio-group v-if="isPlaylist" v-model="form.selectionMode" style="margin-bottom: 14px">
-          <el-radio-button value="all">全部 {{ probe.total }} 个</el-radio-button>
-          <el-radio-button value="range">指定范围</el-radio-button>
-        </el-radio-group>
-
-        <div v-if="isPlaylist && form.selectionMode === 'range'" class="range-row">
-          <span class="range-label">从第</span>
-          <el-input-number v-model="form.startIndex" :min="1" :max="probe.total" controls-position="right" />
-          <span class="range-label">个开始，最多搬运</span>
-          <el-input-number v-model="form.maxItems" :min="0" :max="probe.total" controls-position="right" />
-          <span class="range-label">个（0 表示不限制）</span>
+        <div v-if="isPlaylist" class="range-row">
+          <el-tag effect="plain" type="success">{{ selectionHint }}</el-tag>
+          <el-button size="small" :icon="'Edit'" @click="openPicker">重新选择</el-button>
+          <span class="muted tip">任务只会包含你勾选的条目，之后仍可在任务详情页取消个别条目</span>
         </div>
 
         <el-table :data="previewEntries" max-height="320" style="width: 100%">
@@ -292,15 +346,27 @@ onMounted(() => {
             </el-radio-group>
           </el-form-item>
 
-          <el-form-item label="字幕与背景音">
+          <el-form-item label="字幕">
             <div class="switch-row">
-              <el-switch v-model="form.burnSubtitles" active-text="烧录中文字幕" />
-              <el-switch v-model="form.keepBgm" active-text="保留原视频背景音" />
-              <div v-if="form.keepBgm" class="volume-row">
-                <span class="muted">背景音量</span>
-                <el-slider v-model="form.bgmVolume" :min="0" :max="0.6" :step="0.02" style="width: 180px" />
-                <span class="mono muted">{{ form.bgmVolume.toFixed(2) }}</span>
-              </div>
+              <el-switch v-model="form.burnSubtitles" active-text="烧录字幕" />
+              <el-radio-group v-model="form.subtitleMode" :disabled="!form.burnSubtitles">
+                <el-radio-button value="bilingual">中英双语</el-radio-button>
+                <el-radio-button value="zh">仅中文</el-radio-button>
+                <el-radio-button value="en">仅英文</el-radio-button>
+              </el-radio-group>
+            </div>
+            <div class="muted inline-help">
+              字号、边距与位置在「系统配置 → 成片合成」中调整（以 1080p 为基准等比缩放）
+            </div>
+          </el-form-item>
+
+          <el-form-item label="原视频音轨">
+            <el-radio-group v-model="form.originalAudio">
+              <el-radio value="remove">完全去掉（只保留 AI 配音）</el-radio>
+              <el-radio value="keep">保留并压低音量</el-radio>
+            </el-radio-group>
+            <div class="muted inline-help">
+              默认完全去掉原声（人声与背景音乐都不保留）
             </div>
           </el-form-item>
 
@@ -362,7 +428,17 @@ onMounted(() => {
           </el-button>
         </div>
       </div>
+      </template>
     </template>
+
+    <CollectionPicker
+      v-model="pickerVisible"
+      :title="probe?.title || ''"
+      :author="probe?.author || ''"
+      :source-type="probe?.source_type || 'playlist'"
+      :entries="entries"
+      @confirm="handlePickerConfirm"
+    />
   </div>
 </template>
 
@@ -399,6 +475,42 @@ onMounted(() => {
   gap: 10px;
   margin-bottom: 14px;
   flex-wrap: wrap;
+}
+
+.picker-gate {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  border-color: #f0d9a8;
+  background: linear-gradient(0deg, #fffdf6, #fffdf6);
+}
+
+.gate-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 20px;
+  color: #d97706;
+  background: #fdf3e0;
+  flex: none;
+}
+
+.gate-body {
+  flex: 1 1 260px;
+  min-width: 240px;
+}
+
+.gate-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.gate-desc {
+  margin: 0;
+  font-size: 13px;
 }
 
 .range-label {

@@ -166,8 +166,12 @@ async def run(out_dir: Path, aspect: str, no_subtitle: bool, asr_provider: str) 
                 "video": {
                     "target_aspect": aspect,
                     "burn_subtitles": True,
-                    "keep_bgm": True,
-                    "bgm_volume": 0.12,
+                    "subtitle_mode": "bilingual",
+                    "subtitle_font_size": 14,
+                    "subtitle_margin_v": 40,
+                    "subtitle_alignment": "bottom",
+                    # 与原声一起处理：默认完全去掉原音轨
+                    "original_audio": "remove",
                     "max_speedup": 1.35,
                     "preset": "veryfast",
                     "crf": 26,

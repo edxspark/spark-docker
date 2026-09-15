@@ -73,7 +73,7 @@ const cards = computed(() => {
       key: 'characters',
       label: '配音字符',
       value: formatNumber(data?.total_characters),
-      hint: '阿里云语音合成累计',
+      hint: '阿里云语音',
       icon: 'Microphone',
       color: '#0f9ba8',
     },
@@ -81,7 +81,7 @@ const cards = computed(() => {
       key: 'disk',
       label: '数据占用',
       value: formatSize(data?.disk_usage_mb),
-      hint: '含下载、成片与字幕',
+      hint: '含下载与成片',
       icon: 'Coin',
       color: '#8a94a6',
     },
@@ -471,39 +471,62 @@ onBeforeUnmount(() => {
 
 .metric-grid {
   margin-bottom: 16px;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  /* 单行排布：6 张卡放得下时永远排成一行（1440px 屏幕下正好 6 列一行铺满，
+    auto-fit + 1fr 会把余量摊给现有卡片，因此右侧不像 auto-fill 那样空一条）。
+    下限 182px 是保证卡片内文案不被压缩的下限值：
+    182px 卡片 = 16×2 内边距 + 34px 图标 + 12px 间距 + 102px 文案区。 */
+  grid-template-columns: repeat(auto-fit, minmax(182px, 1fr));
 }
 
 .metric-card {
+  /* 图标在左、文案在右（水平对齐），图标垂直居中于三行文案 */
   display: flex;
-  gap: 14px;
   align-items: center;
-  padding: 16px 18px;
+  gap: 12px;
+  padding: 14px 16px;
+  /* 高度交给网格行（同一行等高），文案再长也不会单独长高 */
 }
 
 .metric-icon {
-  width: 40px;
-  height: 40px;
+  width: 34px;
+  height: 34px;
   border-radius: 10px;
   display: grid;
   place-items: center;
   flex: none;
 }
 
+.metric-body {
+  /* 窄列里允许收缩；配合下面三行的 nowrap+ellipsis 保证不换行 */
+  min-width: 0;
+  flex: 1;
+}
+
 .metric-label {
   font-size: 12.5px;
+  line-height: 1.35;
   color: var(--spark-text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .metric-value {
-  font-size: 22px;
+  font-size: 21px;
   font-weight: 650;
-  line-height: 1.25;
+  line-height: 1.3;
   letter-spacing: -0.5px;
+  /* 大数（如 1,234,567）不换行，保持一行高度一致 */
+  white-space: nowrap;
 }
 
 .metric-hint {
   font-size: 11.5px;
+  line-height: 1.35;
+  /* 提示文案固定一行：过长省略，卡片高度不受文案长度影响 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .two-col {
@@ -511,6 +534,22 @@ onBeforeUnmount(() => {
   grid-template-columns: 1.6fr 1fr;
   gap: 16px;
   margin-bottom: 16px;
+  /* 两侧面板等高：高度由较高的那张决定，两张都拉满，顶边/底边对齐；
+     窄屏堆叠成一列时每一行同样等高（行高取内容较高的那张）。 */
+  align-items: stretch;
+  grid-auto-rows: 1fr;
+}
+
+/* 两块面板都是「标题 + 内容」，内容自适应撑满剩余高度并垂直居中，
+   这样图表区与运行环境区的视觉重心一致，不会一张上重一张下重 */
+.two-col > .panel {
+  display: flex;
+  flex-direction: column;
+  margin-top: 0;
+}
+
+.two-col > .panel > .panel-title {
+  flex: none;
 }
 
 @media (max-width: 1080px) {
@@ -520,13 +559,18 @@ onBeforeUnmount(() => {
 }
 
 .chart {
-  height: 260px;
+  flex: 1;
+  min-height: 260px;
 }
 
 .env-list {
   display: flex;
   flex-direction: column;
+  justify-content: center;
   gap: 10px;
+  /* 撑满标题以下的剩余高度：与左侧图表区等高，行距自动均分 */
+  flex: 1;
+  min-height: 0;
 }
 
 .env-row {

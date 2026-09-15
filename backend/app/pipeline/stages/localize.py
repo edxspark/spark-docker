@@ -8,6 +8,7 @@ from pathlib import Path
 
 from app.pipeline.context import ItemState, StageContext
 from app.providers.base import ProviderError
+from app.services import ass_subtitles
 from app.services.subtitles import Cue, reindex, to_srt
 from app.utils import ffmpeg as ffmpeg_utils
 from app.utils.text import normalize_punct
@@ -225,22 +226,16 @@ async def stage_align(ctx: StageContext, state: ItemState) -> None:
             on_progress=on_progress,
         )
 
-        if video_cfg.get("keep_bgm", True) and media.has_audio:
-            await ctx.reporter.item_stage(
-                state.item.id, "align", 70, "混入原声背景…", overall=ctx.overall_for("align", 70)
-            )
-            mixed = state.paths.audio_dir / "mixed.m4a"
-            await ffmpeg_utils.mix_voice_with_bgm(
-                voice_track,
-                video_path,
-                mixed,
-                bgm_volume=float(video_cfg.get("bgm_volume", 0.12)),
-                voice_volume=float(video_cfg.get("voice_volume", 1.0)),
-                total_duration=total_duration,
-            )
-            final_audio = mixed
-        else:
-            final_audio = voice_track
+        final_audio = await _mix_audio(ctx, state, video_cfg, video_path, voice_track, media, total_duration)
+        if str(video_cfg.get("original_audio", "remove")) == "remove" and final_audio == voice_track:
+            if ctx.config.tts.get("provider") == "mock":
+                await ctx.reporter.log(
+                    "已按设置丢弃原声，但当前语音合成是 Mock（产出静音），因此成片会没有声音。"
+                    "请在「系统配置 → 语音合成」切换到阿里云真实配音后再重跑",
+                    level="error",
+                    stage="align",
+                    item_id=state.item.id,
+                )
 
         state.paths.dub_audio = final_audio
         await ctx.reporter.item_update(
@@ -249,29 +244,7 @@ async def stage_align(ctx: StageContext, state: ItemState) -> None:
 
     await ctx.reporter.item_stage(state.item.id, "align", 80, "渲染成片…", overall=ctx.overall_for("align", 80))
 
-    subtitle_for_burn: Path | None = None
-    if state.cues_zh and video_cfg.get("burn_subtitles", True):
-        # 烧录用「短行」字幕：长句拆成两行更易读
-        subtitle_for_burn = state.paths.subtitle_zh
-        if not subtitle_for_burn.exists():
-            subtitle_for_burn = None
-
-    style = ffmpeg_utils.build_subtitle_style(
-        int(video_cfg.get("subtitle_font_size", 20)),
-        str(video_cfg.get("subtitle_font_name", "") or ""),
-        int(video_cfg.get("subtitle_margin_v", 60)),
-    )
-    if subtitle_for_burn is not None:
-        chosen_font = ffmpeg_utils.resolve_subtitle_font(
-            str(video_cfg.get("subtitle_font_name", "") or "")
-        )
-        if chosen_font != (video_cfg.get("subtitle_font_name") or ""):
-            await ctx.reporter.log(
-                f"字幕字体使用「{chosen_font}」（系统可用字体中自动选择；"
-                "macOS 的 PingFang SC 无法被 libass 加载，故未采用）",
-                stage="align",
-                item_id=state.item.id,
-            )
+    subtitle_for_burn = await _build_subtitle_file(ctx, state, video_cfg, media)
 
     state.paths.output.parent.mkdir(parents=True, exist_ok=True)
     await ffmpeg_utils.render_final(
@@ -280,8 +253,7 @@ async def stage_align(ctx: StageContext, state: ItemState) -> None:
         subtitle=subtitle_for_burn,
         out_path=state.paths.output,
         target_aspect=str(video_cfg.get("target_aspect", "original")),
-        burn=bool(video_cfg.get("burn_subtitles", True)) and subtitle_for_burn is not None,
-        style=style,
+        burn=subtitle_for_burn is not None,
         crf=int(video_cfg.get("crf", 20)),
         preset=str(video_cfg.get("preset", "medium")),
     )
@@ -350,8 +322,131 @@ def tts_config_key(ctx: StageContext) -> str:
 
 def render_config_key(ctx: StageContext) -> str:
     cfg = ctx.config.merged("video")
-    return (
-        f"{cfg.get('target_aspect')}:{cfg.get('burn_subtitles')}:{cfg.get('keep_bgm')}:"
-        f"{cfg.get('bgm_volume')}:{cfg.get('voice_volume')}:{cfg.get('max_speedup')}:"
-        f"{cfg.get('subtitle_font_size')}:{cfg.get('subtitle_font_name')}"
+    return ":".join(
+        str(cfg.get(key))
+        for key in (
+            "target_aspect",
+            "burn_subtitles",
+            "original_audio",
+            "bgm_volume",
+            "voice_volume",
+            "max_speedup",
+            "subtitle_mode",
+            "subtitle_font_size",
+            "subtitle_font_name",
+            "subtitle_margin_v",
+            "subtitle_alignment",
+            "subtitle_outline",
+        )
     )
+
+
+async def _mix_audio(
+    ctx: StageContext,
+    state: ItemState,
+    video_cfg: dict,
+    video_path: Path,
+    voice_track: Path,
+    media,
+    total_duration: float,
+) -> Path:
+    """决定成片的音轨。
+
+    remove（默认）—— 完全丢弃原音轨，成片只有 AI 配音
+    keep          —— 原音轨压低后与配音混合
+    """
+    mode = str(video_cfg.get("original_audio", "remove"))
+
+    if mode == "remove":
+        if not media.has_audio:
+            pass  # 原片本来就没音轨，没什么可去掉的
+        return voice_track
+
+    if not media.has_audio:
+        await ctx.reporter.log(
+            "原视频没有音轨，成片只包含配音", stage="align", item_id=state.item.id
+        )
+        return voice_track
+
+    await ctx.reporter.item_stage(
+        state.item.id, "align", 70, "混入原声背景…", overall=ctx.overall_for("align", 70)
+    )
+    mixed = state.paths.audio_dir / "mixed.m4a"
+    await ffmpeg_utils.mix_voice_with_bgm(
+        voice_track,
+        video_path,
+        mixed,
+        bgm_volume=float(video_cfg.get("bgm_volume", 0.12)),
+        voice_volume=float(video_cfg.get("voice_volume", 1.0)),
+        total_duration=total_duration,
+    )
+    return mixed
+
+
+async def _build_subtitle_file(
+    ctx: StageContext,
+    state: ItemState,
+    video_cfg: dict,
+    media,
+) -> Path | None:
+    """生成用于烧录的 ASS 字幕（支持中英双语），返回文件路径。
+
+    自己生成 ASS 而不是直接烧 SRT：libass 解析 SRT 时会套用 PlayResY=288 的
+    默认坐标系，字号与边距被放大约 6 倍。显式指定 PlayRes 后，字号就是真实像素。
+    """
+    if not video_cfg.get("burn_subtitles", True):
+        return None
+
+    mode = str(video_cfg.get("subtitle_mode", "bilingual"))
+    primary = state.cues_zh if mode != "en" else state.cues_en
+    secondary = state.cues_en if mode == "bilingual" else None
+
+    if not primary:
+        # 没有中文字幕时退回英文字幕，总比没有字幕好
+        primary = state.cues_en
+        secondary = None
+        mode = "en"
+    if not primary:
+        return None
+
+    target_aspect = str(video_cfg.get("target_aspect", "original"))
+    width, height = ass_subtitles.output_resolution(media.width, media.height, target_aspect)
+
+    style = ass_subtitles.SubtitleStyle(
+        font_name=ffmpeg_utils.resolve_subtitle_font(str(video_cfg.get("subtitle_font_name", "") or "")),
+        font_size=int(video_cfg.get("subtitle_font_size", 14)),
+        margin_v=int(video_cfg.get("subtitle_margin_v", 40)),
+        alignment=str(video_cfg.get("subtitle_alignment", "bottom")),
+        outline=int(video_cfg.get("subtitle_outline", 1)),
+    )
+    content = ass_subtitles.build_ass(
+        primary,
+        width=width,
+        height=height,
+        style=style,
+        secondary_cues=secondary,
+    )
+
+    ass_path = state.paths.subtitle_zh.with_suffix(".ass")
+    ass_path.parent.mkdir(parents=True, exist_ok=True)
+    ass_path.write_text(content, encoding="utf-8")
+
+    state.stats["subtitle_burn"] = {
+        "mode": mode,
+        "font": style.font_name,
+        "font_size_reference": style.font_size,
+        "font_size_actual": style.scaled_font_size(height),
+        "margin_v_actual": style.scaled_margin(height),
+        "alignment": style.alignment,
+        "resolution": f"{width}x{height}",
+        "lines": len(primary),
+    }
+    await ctx.reporter.log(
+        f"字幕（{ {'bilingual': '中英双语', 'zh': '仅中文', 'en': '仅英文'}.get(mode, mode) }）："
+        f"字号 {style.scaled_font_size(height)}px（1080p 基准 {style.font_size}）、"
+        f"位置{ {'bottom': '底部', 'middle': '居中', 'top': '顶部'}.get(style.alignment, style.alignment) }、"
+        f"画布 {width}x{height}",
+        stage="align",
+        item_id=state.item.id,
+    )
+    return ass_path

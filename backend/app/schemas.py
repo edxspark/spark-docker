@@ -19,7 +19,9 @@ class TaskOptions(BaseModel):
     schedule_at: str | None = None
     target_aspect: Literal["original", "9:16", "16:9"] | None = None
     burn_subtitles: bool | None = None
-    keep_bgm: bool | None = None
+    subtitle_mode: Literal["bilingual", "zh", "en"] | None = None
+    subtitle_alignment: Literal["bottom", "middle", "top"] | None = None
+    original_audio: Literal["remove", "keep"] | None = None
     bgm_volume: float | None = Field(default=None, ge=0.0, le=2.0)
     description: str | None = None
     tags: list[str] | None = None
@@ -28,6 +30,10 @@ class TaskOptions(BaseModel):
 class CreateTaskRequest(BaseModel):
     url: str = Field(min_length=5)
     title: str = ""
+    # 合集精确挑中的条目标识（按顺序即条目顺序）。提供时优先于 start_index/max_items，
+    # 前端弹窗让用户逐条勾选合集条目后即用它提交，避免「一下子创建很多任务」。
+    # 特殊值 "all" 表示用户在弹窗里显式确认了「全选」。
+    selected_video_ids: list[str] | None = Field(default=None, max_length=5000)
     # 合集只搬运前 N 个（0 或 null 表示全部）
     max_items: int | None = Field(default=None, ge=0, le=500)
     # 从第几个开始（1 起）
@@ -49,6 +55,8 @@ class ProbeEntry(BaseModel):
     author: str = ""
     duration: float = 0.0
     thumbnail: str = ""
+    upload_date: str = ""
+    view_count: int = 0
 
 
 class ProbeResponse(BaseModel):

@@ -129,14 +129,23 @@ class VideoConfig(BaseModel):
 
     # 画面：original 保留原比例；9:16 竖屏（上下加模糊背景）；16:9 横屏
     target_aspect: Literal["original", "9:16", "16:9"] = "original"
-    # 烧录中文字幕（抖音更吃字幕）
+    # 烧录字幕（抖音更吃字幕）
     burn_subtitles: bool = True
-    subtitle_font_size: int = Field(default=20, ge=8, le=72)
+    # 字幕内容：双语（中英两行）/ 仅中文 / 仅英文
+    subtitle_mode: Literal["bilingual", "zh", "en"] = "bilingual"
+    # 字号与边距都以 1080p 为基准，按成片分辨率等比缩放，
+    # 因此这里的数字就是「1080p 画面上的真实像素」，换分辨率观感一致。
+    subtitle_font_size: int = Field(default=14, ge=6, le=120)
     # 留空则自动选择系统中真实可用、libass 能加载的中文字体
     subtitle_font_name: str = ""
-    subtitle_margin_v: int = Field(default=60, ge=0, le=400)
-    # 保留原视频背景音（压低音量做人声垫底）
-    keep_bgm: bool = True
+    subtitle_margin_v: int = Field(default=40, ge=0, le=600)
+    subtitle_alignment: Literal["bottom", "middle", "top"] = "bottom"
+    subtitle_outline: int = Field(default=1, ge=0, le=6)
+    # 原视频音轨的处理方式：
+    #   remove —— 完全丢弃原音轨（人声与背景音乐都不要），成片只有配音
+    #   keep   —— 保留原音轨并压低音量，与配音混合
+    original_audio: Literal["remove", "keep"] = "remove"
+    # 保留原音轨时的音量
     bgm_volume: float = Field(default=0.12, ge=0.0, le=2.0)
     voice_volume: float = Field(default=1.0, ge=0.0, le=4.0)
     # 中文字幕变长导致超时，允许的最大加速比；超出则截断该句

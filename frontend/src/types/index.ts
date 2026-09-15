@@ -120,6 +120,8 @@ export interface ProbeEntry {
   author: string
   duration: number
   thumbnail: string
+  upload_date: string
+  view_count: number
 }
 
 export interface ProbeResponse {
@@ -138,7 +140,9 @@ export interface TaskOptions {
   schedule_at?: string | null
   target_aspect?: 'original' | '9:16' | '16:9' | null
   burn_subtitles?: boolean | null
-  keep_bgm?: boolean | null
+  subtitle_mode?: 'bilingual' | 'zh' | 'en' | null
+  subtitle_alignment?: 'bottom' | 'middle' | 'top' | null
+  original_audio?: 'remove' | 'keep' | null
   bgm_volume?: number | null
   description?: string | null
   tags?: string[] | null
@@ -147,6 +151,8 @@ export interface TaskOptions {
 export interface CreateTaskPayload {
   url: string
   title?: string
+  /** 合集弹窗里勾选的条目标识；["all"] 表示显式确认「全选」 */
+  selected_video_ids?: string[]
   max_items?: number | null
   start_index?: number
   options?: TaskOptions

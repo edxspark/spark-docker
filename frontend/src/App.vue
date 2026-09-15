@@ -46,8 +46,8 @@ onMounted(async () => {
         <div class="brand-logo">S</div>
         <transition name="fade">
           <div v-if="!collapsed" class="brand-text">
-            <div class="brand-name">Spark 搬运工作台</div>
-            <div class="brand-sub">YouTube → 抖音</div>
+            <div class="brand-name">SparkDocker</div>
+            <div class="brand-sub">YouTube → Douyin</div>
           </div>
         </transition>
       </div>

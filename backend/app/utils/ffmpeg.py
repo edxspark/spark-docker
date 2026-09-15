@@ -406,16 +406,13 @@ def _escape_sub_path(path: Path) -> str:
     return text.replace("\\", "\\\\").replace(":", r"\:").replace("'", r"\'")
 
 
-async def burn_subtitles(video: Path, subtitle: Path, out_path: Path, *, style: str) -> Path:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    await run_ffmpeg([
-        "-i", str(video),
-        "-vf", f"subtitles='{_escape_sub_path(subtitle)}':force_style='{style}'",
-        "-c:a", "copy",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-        str(out_path),
-    ])
-    return out_path
+def subtitle_filter(subtitle: Path) -> str:
+    """构造 subtitles 滤镜参数。
+
+    传入的是自带样式的 ASS，因此不再使用 force_style——libass 解析 SRT 时
+    会套用 PlayResY=288 的默认坐标系，导致字号与边距被放大约 6 倍，不可预期。
+    """
+    return f"subtitles='{_escape_sub_path(subtitle)}'"
 
 
 async def render_final(
@@ -426,7 +423,6 @@ async def render_final(
     out_path: Path,
     target_aspect: str = "original",
     burn: bool = True,
-    style: str = "",
     crf: int = 20,
     preset: str = "medium",
 ) -> Path:
@@ -452,8 +448,7 @@ async def render_final(
             "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black"
         )
     if burn and subtitle is not None:
-        sub_filter = f"subtitles='{_escape_sub_path(subtitle)}':force_style='{style}'"
-        filters.append(sub_filter)
+        filters.append(subtitle_filter(subtitle))
 
     if filters:
         args += ["-vf", ",".join(filters)]
