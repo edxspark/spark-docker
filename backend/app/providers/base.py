@@ -185,6 +185,11 @@ class BaseASR(ABC):
 
     name = "base"
 
+    # 条目是否已按真实语音时间切好（词级时间戳）。
+    # 为 True 时流水线跳过「按标点合并碎片」这一步——那是为 YouTube 自动字幕准备的，
+    # 用在精确时间轴上反而会把已经对齐的边界重新合并掉。
+    cues_are_timed: bool = False
+
     @abstractmethod
     async def transcribe(
         self,

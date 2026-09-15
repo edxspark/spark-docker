@@ -36,3 +36,7 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+
+# 字幕预览对照图（可由 scripts/preview_subtitles.py 重新生成）
+data/previews/

@@ -189,3 +189,14 @@ class TestResult(BaseModel):
 class MessageOut(BaseModel):
     ok: bool = True
     message: str = ""
+
+
+class PublishItemRequest(BaseModel):
+    """手动发布参数。
+
+    手动发布默认为「立刻上传」：系统配置里的定时延迟只对自动发布生效，
+    否则用户点「立即发布」却被静默排到几小时之后，与所见不符。
+    需要定时发布时显式传 immediate=false。
+    """
+
+    immediate: bool = True

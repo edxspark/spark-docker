@@ -332,6 +332,8 @@ def render_config_key(ctx: StageContext) -> str:
             "voice_volume",
             "max_speedup",
             "subtitle_mode",
+            "subtitle_max_duration",
+            "subtitle_max_chars",
             "subtitle_font_size",
             "subtitle_font_name",
             "subtitle_margin_v",

@@ -28,6 +28,7 @@ from app.schemas import (
     PipelineMeta,
     ProbeEntry,
     ProbeResponse,
+    PublishItemRequest,
     TaskDetailOut,
     TaskItemOut,
     TaskLogOut,
@@ -451,9 +452,14 @@ async def delete_task(
 async def publish_item(
     task_id: int,
     item_id: int,
+    payload: PublishItemRequest | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> TaskItemOut:
-    """手动发布某个已产出的成片（用于关闭自动发布后的人工确认）。"""
+    """手动发布某个已产出的成片（默认关闭自动发布时的确认发布入口）。
+
+    手动发布默认立刻上传；系统配置里的定时延迟只对自动发布生效，
+    除非显式传 immediate=false。
+    """
     item = await session.get(TaskItem, item_id)
     if item is None or item.task_id != task_id:
         raise HTTPException(status_code=404, detail="条目不存在")
@@ -464,6 +470,8 @@ async def publish_item(
     if not output.exists():
         raise HTTPException(status_code=400, detail=f"成片文件不存在：{output}")
 
+    immediate = True if payload is None else payload.immediate
+
     config = await settings_store.load_all(session)
     publisher = build_publisher(PublishConfig(**config["publish"]), settings.auth_dir / "douyin_default.json")
     from app.providers.base import PublishRequest
@@ -472,7 +480,10 @@ async def publish_item(
     options = dict(task.options or {}) if task else {}
     from app.pipeline.stages.deliver import resolve_schedule
 
-    schedule_at = resolve_schedule(options, config["publish"])
+    schedule_at = None if immediate else resolve_schedule(options, config["publish"])
+    if schedule_at:
+        # 延迟按配置算，但用户按的是「立即发布」，这里留痕便于排查
+        logger.info("手动发布走定时：item=%s schedule_at=%s", item_id, schedule_at)
 
     cover = settings.data_dir / item.cover_path if item.cover_path else None
     try:

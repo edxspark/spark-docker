@@ -14,6 +14,7 @@ from app.services.subtitles import (
     normalize_cues,
     parse_subtitle_file,
     reindex,
+    split_long_cues,
     to_srt,
 )
 from app.utils import ffmpeg as ffmpeg_utils
@@ -163,12 +164,20 @@ async def stage_subtitle(ctx: StageContext, state: ItemState) -> None:
         return
 
     cfg = ctx.config.merged("video")
-    max_duration = float(cfg.get("sentence_max_duration", 8.0))
-    max_chars = int(cfg.get("sentence_max_chars", 120))
+    # 断句与显示使用同一组上限：先按句合并碎片，再把仍然过长的条目切开。
+    # 两者共用一套参数，避免「合并到 8 秒、显示又要求 4 秒」这种自相矛盾。
+    max_duration = float(cfg.get("subtitle_max_duration", 5.0))
+    max_chars = int(cfg.get("subtitle_max_chars", 84))
 
     source_total = len(state.cues_en)
-    merged = reindex(merge_into_sentences(state.cues_en, max_duration=max_duration, max_chars=max_chars))
-    state.cues_en = merged
+    if state.stats.get("asr_timed"):
+        # 语音识别已给出词级时间轴：边界是真实的，不要再按标点重新合并
+        split = split_long_cues(state.cues_en, max_duration=max_duration, max_chars=max_chars)
+    else:
+        merged = merge_into_sentences(state.cues_en, max_duration=max_duration, max_chars=max_chars)
+        split = split_long_cues(merged, max_duration=max_duration, max_chars=max_chars)
+    state.cues_en = reindex(split)
+    merged = state.cues_en
     state.paths.subtitle_en.parent.mkdir(parents=True, exist_ok=True)
     state.paths.subtitle_en.write_text(to_srt(merged), encoding="utf-8")
 
@@ -294,6 +303,8 @@ async def _acquire_subtitle_via_asr(ctx: StageContext, state: ItemState) -> None
     elapsed = time.monotonic() - started
     state.cues_en = reindex(normalize_cues(cues))
     state.stats["asr_done"] = True
+    # 记录时间轴是否来自词级识别：为真时后续跳过按标点的碎片合并
+    state.stats["asr_timed"] = bool(getattr(asr, "cues_are_timed", False))
     state.stats["subtitle_source"] = {"kind": "asr", "cues": len(state.cues_en), "provider": provider}
     state.stats["asr"] = {
         "provider": provider,

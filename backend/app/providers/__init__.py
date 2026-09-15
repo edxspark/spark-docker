@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from app.providers.asr.aliyun import AliyunASR, MockASR
+from app.providers.asr.whisper import WhisperASR
 from app.providers.base import (
     BaseASR,
     BasePublisher,
@@ -57,6 +58,8 @@ def build_asr(config: ASRConfig, tts_config: TTSConfig) -> BaseASR:
     """语音识别复用语音合成的项目凭证（同一阿里云项目）。"""
     if config.provider == "mock":
         return MockASR(config)
+    if config.provider == "whisper":
+        return WhisperASR(config)
     return AliyunASR(config, tts_config)
 
 

@@ -102,8 +102,10 @@ class PublishConfig(BaseModel):
 
     provider: Literal["douyin", "mock"] = "mock"
     headless: bool = False
-    # 是否在流水线末尾自动发布；关闭则只产出成片，待人工确认后手动发布
-    auto_publish: bool = True
+    # 是否在流水线末尾自动发布。默认关闭：流水线只产出成片与文案，
+    # 条目停在「待发布」，由人在任务详情页确认后手动发布；
+    # 想全自动发布，需要在「系统配置 → 发布」里显式打开。
+    auto_publish: bool = False
     # 立即发布时下拉框文案
     title_max_len: int = Field(default=30, ge=1, le=200)
     default_tags: list[str] = Field(default_factory=lambda: ["视频搬运", "涨知识", "科普"])
@@ -133,9 +135,14 @@ class VideoConfig(BaseModel):
     burn_subtitles: bool = True
     # 字幕内容：双语（中英两行）/ 仅中文 / 仅英文
     subtitle_mode: Literal["bilingual", "zh", "en"] = "bilingual"
+    # 单条字幕的显示上限。行业惯例：最多 2 行、单条停留 1~7 秒（常见 2~4 秒）。
+    # 超过上限的长句会被按自然边界切分并按字数比例分配时间。
+    # 设得过大会出现「一句话占屏十几秒」，观感就是字幕与话音对不上。
+    subtitle_max_duration: float = Field(default=5.0, ge=1.0, le=30.0)
+    subtitle_max_chars: int = Field(default=84, ge=20, le=300)
     # 字号与边距都以 1080p 为基准，按成片分辨率等比缩放，
     # 因此这里的数字就是「1080p 画面上的真实像素」，换分辨率观感一致。
-    subtitle_font_size: int = Field(default=14, ge=6, le=120)
+    subtitle_font_size: int = Field(default=40, ge=6, le=120)
     # 留空则自动选择系统中真实可用、libass 能加载的中文字体
     subtitle_font_name: str = ""
     subtitle_margin_v: int = Field(default=40, ge=0, le=600)
@@ -166,9 +173,20 @@ class GeneralConfig(BaseModel):
 class ASRConfig(BaseModel):
     """语音识别（无字幕视频的兜底）。凭证与「语音合成」共用同一个阿里云项目。"""
 
-    provider: Literal["aliyun", "mock"] = "aliyun"
+    # whisper = 本地模型（默认，准确率最高且自带词级时间戳，无按量费用）
+    # aliyun  = 阿里云一句话识别（无需本地模型，但实测英文准确率明显较低）
+    # mock    = 离线占位
+    provider: Literal["whisper", "aliyun", "mock"] = "whisper"
     # 无字幕时是否自动语音识别；关闭则保留原声不配音
     enabled: bool = True
+    # 本地模型档位：越大越准也越慢。英文视频建议带 .en 后缀的档位
+    whisper_model: str = "small"
+    whisper_device: Literal["cpu", "cuda", "auto"] = "cpu"
+    # int8 在 CPU 上最快；有 NVIDIA 显卡可改 float16
+    whisper_compute_type: str = "int8"
+    # 单条字幕的字数与时长上限（词级时间戳的合并依据）
+    whisper_max_cue_chars: int = Field(default=84, ge=20, le=300)
+    whisper_max_cue_duration: float = Field(default=5.0, ge=1.0, le=30.0)
     # 识别语言提示（仅用于日志与人为判断，实际语种由阿里云控制台的项目模型决定）
     language: str = "en"
     # 单块上限（秒）。阿里云单次请求音频不超过 60 秒，留出余量
