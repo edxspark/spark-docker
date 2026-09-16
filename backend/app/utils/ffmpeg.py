@@ -203,42 +203,125 @@ async def stretch_fit(src: Path, dst: Path, target_duration: float, *, max_speed
     return await atempo(src, dst, speed)
 
 
+def audio_codec_args(dst: Path) -> list[str]:
+    """按输出后缀挑编码器。
+
+    trim_silence 会被 fit_segment 当中间步骤调用，此时用 .wav 承接中间结果，
+    避免「裁剪一次 mp3 + 变速一次 mp3 + 补齐一次 mp3」的三次有损编码。
+    """
+    suffix = dst.suffix.lower()
+    if suffix == ".wav":
+        return ["-c:a", "pcm_s16le"]
+    if suffix in {".m4a", ".aac"}:
+        return ["-c:a", "aac", "-b:a", "192k"]
+    if suffix == ".flac":
+        return ["-c:a", "flac"]
+    return ["-c:a", "libmp3lame", "-q:a", "3"]
+
+
+async def trim_silence(
+    src: Path,
+    dst: Path,
+    *,
+    threshold_db: float = -38.0,
+    keep: float = 0.06,
+) -> Path:
+    """裁掉音频首尾的静音，保留 keep 秒的气口。
+
+    为什么必须裁：语音合成（尤其 ChatTTS）每次生成都会在句首留 0~0.9 秒空白，
+    句尾也常带一截。而 fit_segment 只按目标时长 apad/裁剪，从不裁这些空白，于是
+
+      1. 语音整体后移，窗口不够时 -t 从尾部硬切，句尾被切掉；
+      2. 窗口比首静音还短时，截出来的整段都是静音——整句话凭空消失；
+         实测「它们之间」窗口 0.25s、首静音 0.35s，语音损失 100%；
+      3. atempo 的加速额度被静音白吃，真正需要压缩的语音反而没被压。
+
+    三者叠加的听感就是「断断续续」。
+
+    只裁首尾，不动句中停顿：句中停顿是自然韵律，一并裁掉会变成念经。
+    用 areverse 做两次首部裁剪，语义比 stop_periods 明确，也不会误删句中停顿。
+    整段都是静音时（Mock 提供者）裁剪结果是空的，此时返回原文件，
+    让后续的 apad 去补足目标时长。
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    filt = (
+        f"silenceremove=start_periods=1:start_threshold={threshold_db}dB:start_silence={keep},"
+        "areverse,"
+        f"silenceremove=start_periods=1:start_threshold={threshold_db}dB:start_silence={keep},"
+        "areverse"
+    )
+    await run_ffmpeg([
+        "-i", str(src),
+        "-af", filt,
+        *audio_codec_args(dst),
+        str(dst),
+    ])
+
+    # 全静音输入时 silenceremove 会把音频整段去掉，产出一个没有任何 MP3 帧的空文件：
+    # 此时 ffprobe 是**报错**而不是返回 0 时长，必须当成异常接住，
+    # 否则 Mock 提供者的占位音轨会在这里把整条流水线打断。
+    try:
+        trimmed = await audio_duration(dst)
+    except FFmpegError:
+        trimmed = 0.0
+
+    if trimmed <= 0:
+        # 全是静音（或解码失败）：保持原样，交给调用方补齐
+        shutil.copy2(src, dst)
+
+    return dst
+
+
 async def fit_segment(
     src: Path,
     dst: Path,
     target_duration: float,
     *,
     max_speed: float = 1.35,
+    trim: bool = True,
 ) -> tuple[Path, float]:
     """把语音严格塞进目标时长，返回 (文件, 实际时长)。
 
-    策略：短了补尾部静音，长了先加速（不超过 max_speed），仍超长则直接截断。
-    严格等于目标时长可以避免逐句累积漂移，配音与画面对齐更稳。
+    策略：先裁掉首尾静音 → 短了补尾部静音，长了加速（不超过 max_speed），
+    仍超长才截断。严格等于目标时长可以避免逐句累积漂移，配音与画面对齐更稳。
+
+    trim 默认为真：不裁静音会让「加速额度被静音吃掉、句尾被切掉」，
+    实测有一半的字幕会因此丢语音（详见 trim_silence 的说明）。
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
     target = max(target_duration, 0.08)
-    actual = await audio_duration(src)
 
     working = src
-    if actual > target:
-        speed = min(actual / target, max_speed)
-        if speed > 1.001:
-            sped = dst.with_name(dst.stem + ".tmp.mp3")
-            working = await atempo(src, sped, speed)
-            actual = await audio_duration(working)
+    temps: list[Path] = []
+    try:
+        if trim:
+            # 中间结果用 .wav 承接：最后统一编码一次，避免反复有损转码
+            trimmed = dst.with_name(dst.stem + ".trim.wav")
+            working = await trim_silence(src, trimmed)
+            if working is not src:
+                temps.append(working)
+        actual = await audio_duration(working)
 
-    # 统一按目标时长裁剪/补齐
-    await run_ffmpeg([
-        "-i", str(working),
-        "-af", f"apad=whole_dur={target:.3f}",
-        "-t", f"{target:.3f}",
-        "-c:a", "libmp3lame", "-q:a", "3",
-        str(dst),
-    ])
+        if actual > target:
+            speed = min(actual / target, max_speed)
+            if speed > 1.001:
+                sped = dst.with_name(dst.stem + ".tmp.mp3")
+                working = await atempo(working, sped, speed)
+                temps.append(working)
+                actual = await audio_duration(working)
 
-    # 清理临时文件（源文件由调用方管理）
-    if working is not src:
-        working.unlink(missing_ok=True)
+        # 统一按目标时长裁剪/补齐
+        await run_ffmpeg([
+            "-i", str(working),
+            "-af", f"apad=whole_dur={target:.3f}",
+            "-t", f"{target:.3f}",
+            "-c:a", "libmp3lame", "-q:a", "3",
+            str(dst),
+        ])
+    finally:
+        # 清理中间文件（源文件由调用方管理）
+        for temp in temps:
+            temp.unlink(missing_ok=True)
     return dst, target
 
 
