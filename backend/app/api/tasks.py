@@ -475,6 +475,35 @@ def _record_publish_attempt(
     item.stats = stats
 
 
+async def _refresh_task_status(session: AsyncSession, task_id: int) -> None:
+    """按条目的最新状态重算任务整体状态与计数。
+
+    使用场景：条目此前因发布失败而被判 failed，之后人工重新发布成功。
+    若不重算，任务会一直停留在「全部失败」。
+    """
+    task = await session.get(Task, task_id)
+    if task is None:
+        return
+    items = (
+        await session.execute(select(TaskItem).where(TaskItem.task_id == task_id))
+    ).scalars().all()
+    total = len(items)
+    done = sum(1 for i in items if i.status == TaskStatus.SUCCEEDED.value)
+    failed = sum(1 for i in items if i.status == TaskStatus.FAILED.value)
+
+    task.total_items = total
+    task.done_items = done
+    task.failed_items = failed
+    if total and done == total:
+        task.status = TaskStatus.SUCCEEDED.value
+        task.message = "全部视频处理完成"
+        task.finished_at = task.finished_at or datetime.now()
+    elif done > 0:
+        task.status = TaskStatus.PARTIAL.value
+        task.message = f"部分成功：成功 {done}，失败 {failed}"
+    # 仍全部失败时保持原状，不掩盖问题
+
+
 @router.post("/{task_id}/items/{item_id}/publish", response_model=TaskItemOut)
 async def publish_item(
     task_id: int,
@@ -561,6 +590,16 @@ async def publish_item(
     item.publish_url = result.work_url or item.publish_url
     item.publish_error = ""
     item.published_at = datetime.now() if result.success else None
+
+    if result.success:
+        # 手动发布/重新发布成功，条目整体状态也要跟着纠正。
+        # 否则此前因发布失败而被标记为 failed 的条目会一直显示「失败」，
+        # 连带残留的「失败于「publish」」消息也不清掉——
+        # 列表里看到的就是「发布成功但状态仍是失败」。
+        item.status = TaskStatus.SUCCEEDED.value
+        item.message = "已发布"
+        item.error = ""
+
     _record_publish_attempt(
         item,
         kind="republish" if republish else "publish",
@@ -568,6 +607,9 @@ async def publish_item(
         message=result.message,
         url=result.work_url,
     )
+    await session.flush()
+    if result.success:
+        await _refresh_task_status(session, task_id)
     await session.commit()
     await session.refresh(item)
     await event_bus.emit(task_id, "item.updated", id=item.id, task_id=task_id, publish_status=item.publish_status)
