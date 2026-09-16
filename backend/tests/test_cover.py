@@ -488,3 +488,42 @@ class TestLandscapeCover:
         con.close()
         assert columns, f"读不到 task_items 表（数据库：{db_path}）"
         assert "cover_landscape_path" in columns, "已有库缺少横封面列，迁移未生效"
+
+
+class TestCoverAspectMatchesPlatform:
+    """封面比例必须与平台封面位严格一致，否则会被居中裁切。
+
+    事故：封面「只显示中间一部分」。实测平台封面位：
+      竖封面位 90x120  -> 0.750 = 3:4
+      横封面位 160x120 -> 1.333 = 4:3
+    且图片以 object-fit: cover 投放——比例不符就会被裁掉两端。
+    原先竖封面沿用了成片比例（16:9 = 1.78），放进 3:4 的位子只剩中间一条。
+    """
+
+    def test_portrait_is_3_4(self):
+        from app.services.cover import PORTRAIT_COVER_SIZE
+
+        width, height = PORTRAIT_COVER_SIZE
+        assert abs(width / height - 3 / 4) < 0.01, f"{width}x{height} 不是 3:4"
+
+    def test_landscape_is_4_3(self):
+        from app.services.cover import LANDSCAPE_COVER_SIZE
+
+        width, height = LANDSCAPE_COVER_SIZE
+        assert abs(width / height - 4 / 3) < 0.01, f"{width}x{height} 不是 4:3"
+
+    def test_platform_slot_ratios_are_recorded(self):
+        """把实测的平台比例固化下来，避免以后又按成片比例出图。"""
+        slots = {"portrait": 90 / 120, "landscape": 160 / 120}
+        from app.services.cover import LANDSCAPE_COVER_SIZE, PORTRAIT_COVER_SIZE
+
+        assert abs(PORTRAIT_COVER_SIZE[0] / PORTRAIT_COVER_SIZE[1] - slots["portrait"]) < 0.01
+        assert abs(LANDSCAPE_COVER_SIZE[0] / LANDSCAPE_COVER_SIZE[1] - slots["landscape"]) < 0.01
+
+    def test_cover_does_not_follow_video_aspect(self):
+        """竖封面不能沿用成片比例——16:9 的成片放进 3:4 的位子会被裁切。"""
+        from app.services.cover import PORTRAIT_COVER_SIZE
+
+        video_ratio = 1920 / 1080
+        cover_ratio = PORTRAIT_COVER_SIZE[0] / PORTRAIT_COVER_SIZE[1]
+        assert abs(video_ratio - cover_ratio) > 0.5, "封面比例竟然跟着成片走"

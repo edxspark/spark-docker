@@ -982,7 +982,12 @@ class DouyinPublisher(BasePublisher):
 
         with contextlib.suppress(Exception):
             await area.scroll_into_view_if_needed(timeout=5000)
-        for _ in range(3):
+        # 弹窗打开偶发失败（实测约每几次出现一次）：多试几轮，并在每轮前重新
+        # 清理引导浮层——它可能在等待期间重新出现并再次拦截点击。
+        for attempt in range(6):
+            if attempt:
+                await _dismiss_onboarding(page)
+                await page.wait_for_timeout(700)
             with contextlib.suppress(Exception):
                 await area.hover()
                 await page.wait_for_timeout(600)
@@ -1000,8 +1005,11 @@ class DouyinPublisher(BasePublisher):
             with contextlib.suppress(Exception):
                 await modal.wait_for(state="visible", timeout=5000)
             if await modal.count() and await modal.is_visible():
+                if attempt:
+                    logger.info("封面弹窗在第 %s 次尝试后打开", attempt + 1)
                 return True
-            await page.wait_for_timeout(800)
+            await page.wait_for_timeout(900)
+        logger.warning("封面弹窗连续 6 次未能打开")
         return False
 
     async def _apply_ai_declaration(self, page, declaration: str = "内容由AI生成") -> None:

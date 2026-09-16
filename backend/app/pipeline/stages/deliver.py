@@ -167,9 +167,11 @@ async def _generate_cover(ctx: StageContext, state: ItemState, title: str, tags:
             media = await ffmpeg_utils.probe(video_file)
         except Exception:  # noqa: BLE001
             media = None
-    width, height = cover_mod.cover_size_for(
-        target_aspect, media.width if media else 0, media.height if media else 0
-    )
+    # 竖封面必须用平台的 3:4，不能用成片比例：
+    # 平台以 object-fit: cover 投放，比例不符会被居中裁切。
+    # target_aspect 仅影响成片画面，与封面位无关。
+    width, height = cover_mod.PORTRAIT_COVER_SIZE
+    _ = target_aspect  # 保留读取以便未来扩展，此处不影响封面尺寸
 
     # 1) 优先使用视频原始缩略图
     if source_mode == "thumbnail":
