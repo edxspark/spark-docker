@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -497,6 +498,37 @@ async def delete_task(
 _PUBLISH_HISTORY_LIMIT = 10
 
 
+def _record_manual_publish_timing(
+    item: TaskItem, elapsed: float, *, rerun: bool, failed: bool = False
+) -> None:
+    """把「手动发布」这一步的耗时也记进 stats["timings"]。
+
+    手动发布不经过流水线（默认配置就是手动发布），不记的话，「发布」永远没有数据——
+    而它往往是整条链路里最慢的一步（87MB 成片上传实测 75 秒到 14 分钟不等）。
+    重新发布沿用同一个 key：这里关心的是「发布要多久」，不是第几次发。
+    """
+    from app.models import STAGE_LABELS
+
+    timings = dict((item.stats or {}).get("timings") or {})
+    entry: dict[str, object] = {
+        "seconds": round(elapsed, 2),
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "manual": True,
+    }
+    if rerun:
+        entry["rerun"] = True
+    if failed:
+        entry["failed"] = True
+    timings["publish"] = entry
+    item.stats = {**(item.stats or {}), "timings": timings}
+    logger.info(
+        "阶段耗时｜%s（手动）：%.1f 秒%s",
+        STAGE_LABELS.get("publish", "publish"),
+        elapsed,
+        "（失败）" if failed else "",
+    )
+
+
 def _record_publish_attempt(
     item: TaskItem, *, kind: str, success: bool, message: str, url: str = ""
 ) -> None:
@@ -601,6 +633,7 @@ async def publish_item(
     cover_landscape = (
         settings.data_dir / item.cover_landscape_path if item.cover_landscape_path else None
     )
+    publish_started = time.perf_counter()
     try:
         result = await publisher.publish(
             PublishRequest(
@@ -620,12 +653,16 @@ async def publish_item(
         item.publish_status = "failed"
         item.publish_error = str(exc)
         _record_publish_attempt(item, kind="republish" if republish else "publish", success=False, message=str(exc))
+        _record_manual_publish_timing(
+            item, time.perf_counter() - publish_started, rerun=republish, failed=True
+        )
         await session.commit()
         raise HTTPException(status_code=502, detail=f"发布失败：{exc}") from exc
 
     if dry_run:
         # 干跑只是自检：不写入「已发布」，也不记录作品链接
         item.message = f"[干跑] {result.message}"[:400]
+        _record_manual_publish_timing(item, time.perf_counter() - publish_started, rerun=True)
         _record_publish_attempt(item, kind="dry_run", success=True, message=result.message)
         await session.commit()
         await session.refresh(item)
@@ -657,6 +694,9 @@ async def publish_item(
                 item.id,
             )
 
+    _record_manual_publish_timing(
+        item, time.perf_counter() - publish_started, rerun=republish, failed=not result.success
+    )
     _record_publish_attempt(
         item,
         kind="republish" if republish else "publish",

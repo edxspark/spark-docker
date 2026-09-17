@@ -212,10 +212,28 @@ async def test_pipeline_end_to_end(prepared, sample_video):
     assert item.stats["output"]["dubbed"] is True
     assert item.stats["subtitle_source"]["kind"] == "manual"
 
+    # 每个跑过的阶段都要留下耗时，供后续做节点性能优化。
+    # 只记总时长是不够的：各阶段耗时差着数量级，看不出该优化哪一步。
+    timings = item.stats["timings"]
+    for stage in ("probe", "download", "subtitle", "translate", "tts", "align", "metadata", "publish"):
+        assert stage in timings, f"阶段没有记录耗时：{stage}"
+        assert timings[stage]["seconds"] >= 0, f"阶段耗时为负：{stage}"
+    # probe 在本用例里被预置的 title/duration 判为「已完成」，因此应当标记为跳过，
+    # 而不是记一个 0 秒——后者会让聚合把它当成真实测量值
+    assert timings["probe"].get("skipped") is True
+    for stage in ("download", "subtitle", "translate", "tts", "align"):
+        assert not timings[stage].get("skipped"), f"{stage} 不该被跳过"
+    assert item.stats["total_seconds"] > 0
+
     # 日志应覆盖各阶段
     stages = {log.stage for log in logs}
     for stage in ("download", "subtitle", "translate", "tts", "align", "publish"):
         assert stage in stages, f"缺少阶段日志：{stage}"
+
+    # 阶段耗时必须有日志行，否则「执行日志」里看不到（这是提这个需求的目的）
+    timing_logs = [log for log in logs if "阶段耗时" in log.message]
+    assert len(timing_logs) >= 6, f"耗时日志太少：{[entry.message for entry in timing_logs]}"
+    assert any("本条耗时合计" in log.message for log in logs), "缺少条目耗时汇总"
 
 
 async def test_pipeline_is_resumable(prepared):

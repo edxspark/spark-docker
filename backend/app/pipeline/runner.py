@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import time
 import traceback
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.events import event_bus
 from app.db import SessionLocal
-from app.models import Task, TaskItem, TaskStatus, utcnow
+from app.models import STAGE_LABELS, Task, TaskItem, TaskStatus, utcnow
 from app.pipeline.context import (
     ItemState,
     PipelineConfig,
@@ -41,6 +44,36 @@ from app.services.subtitles import normalize_cues, parse_subtitle_file, reindex
 logger = logging.getLogger(__name__)
 
 StageFn = Callable[[StageContext, ItemState], Awaitable[None]]
+
+# 超过这个秒数就算「偏慢」，日志里标出来——这样扫一眼日志就知道该优化哪一步。
+_SLOW_STAGE_SECONDS = 120.0
+
+
+def _human_duration(seconds: float) -> str:
+    """把秒数写成日志里好读的形式：12.4 秒 / 5 分 11 秒 / 1 小时 3 分。"""
+    if seconds < 60:
+        return f"{seconds:.1f} 秒"
+    if seconds < 3600:
+        minutes, rest = divmod(int(round(seconds)), 60)
+        return f"{minutes} 分 {rest} 秒"
+    hours, rest = divmod(int(round(seconds)), 3600)
+    return f"{hours} 小时 {rest // 60} 分"
+
+
+def summarize_timings(timings: dict[str, Any]) -> str:
+    """把各阶段耗时汇总成一行，按耗时从大到小排——优化的优先级一眼可见。"""
+    rows: list[tuple[str, float]] = []
+    for stage_name, value in (timings or {}).items():
+        seconds = float((value or {}).get("seconds") or 0)
+        if seconds <= 0:
+            continue
+        rows.append((stage_name, seconds))
+    if not rows:
+        return ""
+    rows.sort(key=lambda row: row[1], reverse=True)
+    parts = [f"{STAGE_LABELS.get(name, name)} {_human_duration(sec)}" for name, sec in rows]
+    return "，".join(parts)
+
 
 STAGES: list[tuple[str, StageFn]] = [
     ("probe", stage_probe),
@@ -221,20 +254,30 @@ class TaskRunner:
         failed_stage = ""
 
         await ctx.reporter.item_update(item_id, status=TaskStatus.RUNNING.value, error="")
+        item_started = time.perf_counter()
         try:
             for stage_name, stage_fn in STAGES:
                 ctx.reporter.raise_if_canceled()
                 if self._already_done(stage_name, state, item, ctx):
+                    # 断点续跑跳过的阶段没有真实耗时。若直接记 0，
+                    # 会把它算进平均值里，把真正该优化的阶段稀释掉。
+                    self._mark_skipped(state, stage_name)
                     await bump(item_id, ctx.overall_for(stage_name, 100))
                     continue
                 failed_stage = stage_name
                 await self._run_stage(ctx, stage_name, stage_fn, state)
+                # 显式记录阶段已完成。
+                # 有些阶段（例如 probe）没有任何外部产物，重跑时有 store=None 的
+                # provider，一旦被重新执行就会直接报错；这里留下确定性标记，
+                # 让 _already_done 不必依赖「猜」。
+                self._mark_completed(state, stage_name)
                 await bump(item_id, ctx.overall_for(stage_name, 100))
 
             await ctx.reporter.item_update(
                 item_id, status=TaskStatus.SUCCEEDED.value, progress=100.0, message="完成", error=""
             )
             await bump(item_id, 100.0)
+            await self._log_item_summary(ctx, state, time.perf_counter() - item_started)
             await ctx.reporter.log(f"视频处理完成：{state.item.title_zh or state.item.title}", item_id=item_id)
 
         except TaskCanceled:
@@ -249,10 +292,52 @@ class TaskRunner:
                 error=message[-4000:],
                 message=f"失败于「{failed_stage}」",
             )
+            # 失败时也要给汇总：卡在哪一步、那一步花了多久，正是排查要的信息
+            with contextlib.suppress(Exception):
+                await self._log_item_summary(
+                    ctx, state, time.perf_counter() - item_started, failed_stage=failed_stage
+                )
             await ctx.reporter.log(
                 f"处理失败（阶段：{failed_stage}）：{message}", level="error", stage=failed_stage, item_id=item_id
             )
             await bump(item_id, 100.0)
+
+    def _mark_completed(self, state: ItemState, stage_name: str) -> None:
+        """记录本阶段已实跑完成（供下次续跑直接跳过）。"""
+        done = list(state.stats.get("stages_completed") or [])
+        if stage_name not in done:
+            done.append(stage_name)
+            state.stats["stages_completed"] = done
+
+    def _mark_skipped(self, state: ItemState, stage_name: str) -> None:
+        """标记该阶段本轮被跳过（已有产物）。
+
+        已经测到真实耗时的阶段保留原值——那是上一次实跑的数据，
+        比「跳过」有信息量得多。
+        """
+        timings = dict(state.stats.get("timings") or {})
+        if stage_name in timings:
+            return
+        timings[stage_name] = {"seconds": 0.0, "skipped": True}
+        state.stats["timings"] = timings
+
+    async def _log_item_summary(
+        self, ctx: StageContext, state: ItemState, elapsed: float, *, failed_stage: str = ""
+    ) -> None:
+        """条目跑完/失败后汇总各阶段耗时，按耗时降序排列。"""
+        state.stats["total_seconds"] = round(elapsed, 1)
+        detail = summarize_timings(state.stats.get("timings") or {})
+        headline = f"本条耗时合计 {_human_duration(elapsed)}"
+        if detail:
+            headline += f"（按耗时排序：{detail}）"
+        if failed_stage:
+            headline += f"；失败于「{STAGE_LABELS.get(failed_stage, failed_stage)}」"
+        await ctx.reporter.log(
+            headline, level="warning" if failed_stage else "info", item_id=state.item.id
+        )
+        await ctx.reporter.item_update(
+            state.item.id, stats={**(state.item.stats or {}), **state.stats}
+        )
 
     async def _run_stage(
         self,
@@ -261,19 +346,72 @@ class TaskRunner:
         stage_fn: StageFn,
         state: ItemState,
     ) -> None:
-        label = dict({"probe": "解析链接", "download": "下载视频与字幕", "subtitle": "字幕清洗与断句",
-                      "translate": "翻译字幕", "tts": "语音合成", "align": "时间轴对齐与合成",
-                      "metadata": "生成标题与话题", "publish": "发布到抖音"}).get(stage_name, stage_name)
+        label = STAGE_LABELS.get(stage_name, stage_name)
         await ctx.reporter.task_update(stage=stage_name, message=f"[{state.item.title[:40]}] {label}")
         await ctx.reporter.log(f"进入阶段：{label}", stage=stage_name, item_id=state.item.id)
+        started = time.perf_counter()
         try:
             await stage_fn(ctx, state)
         except ProviderError as exc:
+            elapsed = time.perf_counter() - started
+            await self._record_timing(ctx, state, stage_name, elapsed, failed=True)
             raise ProviderError(f"{label}：{exc}") from exc
+        except BaseException:
+            # 取消/超时也要留下耗时：否则最需要优化的「卡住的那一步」恰好没有数据
+            elapsed = time.perf_counter() - started
+            await self._record_timing(ctx, state, stage_name, elapsed, failed=True)
+            raise
+        await self._record_timing(ctx, state, stage_name, time.perf_counter() - started)
+
+    async def _record_timing(
+        self,
+        ctx: StageContext,
+        state: ItemState,
+        stage_name: str,
+        elapsed: float,
+        *,
+        failed: bool = False,
+    ) -> None:
+        """记录单个阶段的耗时：写进 stats 供后续分析，同时打一条人能读的日志。
+
+        为什么要单独记：一次搬运里各阶段耗时差着数量级（下载几十秒、语音合成几分钟、
+        发布几分钟），只说「任务用了 18 分钟」根本看不出该优化哪里。
+        """
+        label = STAGE_LABELS.get(stage_name, stage_name)
+        entry: dict[str, Any] = {
+            # 保留到 0.01 秒：0.1 秒的粒度会把很快的阶段记成 0.0，
+            # 和「本轮跳过、没有耗时」混成同一个样子
+            "seconds": round(elapsed, 2),
+            "at": utcnow().isoformat(timespec="seconds"),
+        }
+        if failed:
+            entry["failed"] = True
+        timings = dict(state.stats.get("timings") or {})
+        timings[stage_name] = entry
+        state.stats["timings"] = timings
+
+        level = "warning" if (failed or elapsed >= _SLOW_STAGE_SECONDS) else "info"
+        note = "（失败）" if failed else ("（偏慢）" if elapsed >= _SLOW_STAGE_SECONDS else "")
+        try:
+            await ctx.reporter.log(
+                f"阶段耗时｜{label}：{_human_duration(elapsed)}{note}",
+                level=level,
+                stage=stage_name,
+                item_id=state.item.id,
+            )
+            # 与各阶段自己的写法保持一致：把累积的 stats 合并落库
+            await ctx.reporter.item_update(
+                state.item.id, stats={**(state.item.stats or {}), **state.stats}
+            )
+        except Exception:  # noqa: BLE001 - 打点失败绝不能影响流水线本身
+            logger.debug("记录阶段耗时失败：%s", stage_name, exc_info=True)
 
     def _already_done(self, stage_name: str, state: ItemState, item: TaskItem, ctx: StageContext) -> bool:
         """断点续跑：已有产物则跳过已完成的阶段，避免重复下载/重复计费。"""
         paths = state.paths
+        # 上一次如果实跑过这个阶段，就直接跳过（probe 这类没有产物的阶段尤其依赖它）
+        if stage_name in (state.stats.get("stages_completed") or []):
+            return True
         if stage_name == "probe":
             return bool(item.title and item.duration)
         if stage_name == "download":
