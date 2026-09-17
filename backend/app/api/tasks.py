@@ -35,6 +35,7 @@ from app.schemas import (
     TaskLogOut,
     TaskOut,
 )
+from app.services import plans as plans_service
 from app.services.settings_store import (
     DownloadConfig,
     PublishConfig,
@@ -191,45 +192,17 @@ async def create_task(
 
     selection_note = _describe_selection(probe_total, entries)
 
-    task = Task(
-        title=(payload.title or truncate(probe.title or "未命名搬运任务", 200)),
-        source_url=payload.url,
-        source_type=probe.source_type,
-        source_id=probe.source_id,
-        author=probe.author,
-        status=TaskStatus.PENDING.value,
-        total_items=len(entries),
+    # 建任务这件事与「搬运计划」共用同一份实现（见 services/plans.py），
+    # 避免两条路径在条目筛选、日志措辞上出现差异
+    task = await plans_service.create_task(
+        session,
+        entries=entries,
+        probe=probe,
+        url=payload.url,
+        title=payload.title or "",
         options=payload.options.model_dump(exclude_none=True),
-        message="已创建，等待执行",
-    )
-    session.add(task)
-    await session.flush()
-
-    for index, entry in enumerate(entries):
-        session.add(
-            TaskItem(
-                task_id=task.id,
-                idx=index,
-                video_id=entry.video_id,
-                url=entry.url or entry.webpage_url,
-                title=entry.title,
-                author=entry.author,
-                duration=entry.duration,
-                thumbnail=entry.thumbnail,
-                description=entry.description,
-                upload_date=entry.upload_date,
-                view_count=entry.view_count,
-                status=TaskStatus.PENDING.value,
-                message="等待执行",
-            )
-        )
-
-    session.add(
-        TaskLog(
-            task_id=task.id,
-            stage="probe",
-            message=f"已解析 {probe.source_type}：{selection_note}",
-        )
+        auto_start=payload.auto_start,
+        source_note=f"已解析 {probe.source_type}：{selection_note}",
     )
     await session.commit()
     await session.refresh(task)

@@ -141,7 +141,7 @@ onBeforeUnmount(() => {
   <div class="page">
     <div class="page-header">
       <div>
-        <h2 class="page-title">任务历史</h2>
+        <h2 class="page-title">搬运历史</h2>
         <p class="page-subtitle">回看已结束的搬运记录，检索、复跑已失败的任务，或导出记录做归档。</p>
       </div>
       <el-button :icon="'Download'" @click="exportCsv">导出 CSV（当前页）</el-button>

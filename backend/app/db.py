@@ -45,6 +45,10 @@ _ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     "task_items": {
         "cover_landscape_path": "TEXT DEFAULT ''",
     },
+    "tasks": {
+        # 任务来自哪个搬运计划（手动创建为 NULL）
+        "plan_id": "INTEGER",
+    },
 }
 
 

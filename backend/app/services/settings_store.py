@@ -86,6 +86,13 @@ class TTSConfig(BaseModel):
     voice_seed: int = Field(default=2222, ge=0)
     timeout: float = Field(default=300.0, ge=10.0, le=1800.0)
     gender_pool_size: int = Field(default=10, ge=2, le=60)
+    # ChatTTS 单次请求字数上限：长句一次性推理容易在结尾出现杂音/含糊，
+    # 超过这个长度就切分后分别合成再拼接
+    tts_chunk_chars: int = Field(default=80, ge=20, le=300)
+    # 合成前是否做文本归一化（英文缩写拆字母、百分号/单位/标点中文化）
+    normalize_text: bool = True
+    # 术语读法：每行一条「原文=读法」
+    term_rules: str = ""
 
     # ---- 阿里云通道字段 ----
     access_key_id: str = ""
@@ -137,6 +144,13 @@ class ChatTTSConfig(BaseModel):
     timeout: float = Field(default=300.0, ge=10.0, le=1800.0)
     # 按性别配音时探测多少个音色（越多越可能同时得到男声与女声）
     gender_pool_size: int = Field(default=10, ge=2, le=60)
+    # 单次请求的字数上限。ChatTTS 的 token 上限有限，长句一次性推理容易在结尾
+    # 出现杂音/含糊；按这个值切成多片分别合成，再裁掉首尾静音拼接起来
+    tts_chunk_chars: int = Field(default=80, ge=20, le=300)
+    # 是否在合成前做文本归一化（英文缩写拆字母、百分号/单位/标点中文化）
+    normalize_text: bool = True
+    # 术语读法：每行一条「原文=读法」；只给原文时按逐字母展开
+    term_rules: str = ""
 
 
 class AliyunTTSConfig(BaseModel):
@@ -279,7 +293,11 @@ class VideoConfig(BaseModel):
 
 class GeneralConfig(BaseModel):
     default_voice: str = "xiaoxian"
+    # 同时执行几个任务（任务级并发）
     max_concurrent_tasks: int = Field(default=1, ge=1, le=8)
+    # 同一个任务里同时处理几个视频（条目级并发）。
+    # 之前固定为进程配置的 2，计划任务一次建几十个条目时用户无从调整。
+    max_concurrent_items: int = Field(default=2, ge=1, le=8)
     keep_source_files: bool = True
     log_retention_days: int = Field(default=30, ge=1, le=365)
     auto_clean_failed: bool = False
@@ -318,6 +336,21 @@ class IntroConfig(BaseModel):
     @classmethod
     def _clean_text(cls, v: Any) -> Any:
         return " ".join(str(v or "").split()).strip()
+
+    def resolved(self, **overrides: Any) -> dict:
+        """合并配置与任务级覆盖，并按「实际是否生效」归一 enabled。
+
+        归一的意义：指纹里必须体现「开关是否生效」这件事。
+        如果直接用 enabled，关掉开关时指纹不变（`0:...` 与开启前一样会含同一段文案），
+        于是「关掉后重跑」会被判定为「配置没变」，旧开头语永远撤不掉。
+        """
+        merged = {**self.model_dump(), **{k: v for k, v in overrides.items() if v is not None}}
+        merged["enabled"] = bool(merged.get("enabled")) and bool(str(merged.get("text") or "").strip())
+        return merged
+
+    def is_active(self, **overrides: Any) -> bool:
+        """是否真的会插入开头语（开关开着且文案非空）。"""
+        return bool(self.resolved(**overrides)["enabled"])
 
 
 class ASRConfig(BaseModel):

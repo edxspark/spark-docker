@@ -44,20 +44,27 @@ def split_for_tts(text: str, max_chars: int = 280) -> list[str]:
     for token in _SENTENCE_BOUNDARY.split(text):
         if not token:
             continue
+        # 单个 token 本身超长：先冲掉已累积的内容，再硬切
+        if len(token) > max_chars:
+            if current:
+                pieces.append(current)
+                current = ""
+            while len(token) > max_chars:
+                pieces.append(token[:max_chars])
+                token = token[max_chars:]
+            current = token
+            continue
         if len(current) + len(token) <= max_chars:
             current += token
             continue
-        if current:
-            pieces.append(current)
-            current = ""
-        # 单个 token 本身超长：硬切
-        while len(token) > max_chars:
-            pieces.append(token[:max_chars])
-            token = token[max_chars:]
+        # 放不下：先冲掉，再把这句作为新片段的开头。
+        # 注意必须保留 token 本身 —— 早期实现里这里把 token 丢掉了，
+        # 于是 max_chars 较小时会「每隔一句少一句」（切分后文本凭空少内容）。
+        pieces.append(current)
         current = token
     if current:
         pieces.append(current)
-    return [p for p in pieces if p.strip()]
+    return [piece for piece in pieces if piece.strip()]
 
 
 def truncate(text: str, limit: int, suffix: str = "…") -> str:

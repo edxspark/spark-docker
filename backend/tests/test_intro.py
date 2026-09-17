@@ -263,7 +263,9 @@ async def test_disabled_intro_keeps_pipeline_unchanged(monkeypatch, sample_video
 
     assert task.status == TaskStatus.SUCCEEDED.value, task.message
     assert item.stats["tts"]["segments"] == item.stats["translate"]["sentences"]
-    assert not (item.stats or {}).get("intro")
+    # 关闭时也要留下「已处理」标记（mode=disabled）：否则每次续跑都会重复撤一次
+    assert (item.stats.get("intro") or {}).get("mode") == "disabled"
+    assert not (item.stats.get("intro") or {}).get("offset")
     zh_text = (settings.data_dir / item.subtitle_zh_path).read_text(encoding="utf-8")
     assert INTRO_TEXT not in zh_text
 

@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import douyin as douyin_api
+from app.api import plans as plans_api
 from app.api import settings as settings_api
 from app.api import stats as stats_api
 from app.api import tasks as tasks_api
@@ -46,9 +47,17 @@ async def lifespan(app: FastAPI):
         # 老库里的语音合成配置是一张表装两套参数，先拆到各通道分组再载入缓存
         await migrate_split_tts_sections(session)
         await settings_store.load_all(session)
+    # 搬运计划调度器：进程内后台循环，到点自动创建任务
+    from app.services.plan_scheduler import plan_scheduler
+
+    plan_scheduler.start()
+
     logger.info("数据目录：%s", settings.data_dir)
     logger.info("服务已就绪：http://%s:%s", settings.host, settings.port)
     yield
+    from app.services.plan_scheduler import plan_scheduler
+
+    await plan_scheduler.stop()
     await dispose_db()
 
 
@@ -70,6 +79,7 @@ app.add_middleware(
 
 app.include_router(settings_api.router)
 app.include_router(tasks_api.router)
+app.include_router(plans_api.router)
 app.include_router(douyin_api.router)
 app.include_router(youtube_api.router)
 app.include_router(stats_api.router)

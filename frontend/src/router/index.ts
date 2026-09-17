@@ -17,6 +17,12 @@ const router = createRouter({
       meta: { title: '新建搬运', icon: 'MagicStick' },
     },
     {
+      path: '/plans',
+      name: 'plans',
+      component: () => import('@/views/PlanListView.vue'),
+      meta: { title: '搬运计划', icon: 'Calendar' },
+    },
+    {
       path: '/tasks',
       name: 'tasks',
       component: () => import('@/views/TaskListView.vue'),
@@ -32,7 +38,7 @@ const router = createRouter({
       path: '/history',
       name: 'history',
       component: () => import('@/views/HistoryView.vue'),
-      meta: { title: '任务历史', icon: 'Clock' },
+      meta: { title: '搬运历史', icon: 'Clock' },
     },
     {
       path: '/douyin',

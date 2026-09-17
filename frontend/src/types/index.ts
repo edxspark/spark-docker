@@ -238,3 +238,46 @@ export interface WsEvent {
   payload: Record<string, any>
   ts?: string
 }
+
+// ---------------------------------------------------------------- 搬运计划
+
+export interface PlanRecord {
+  id: number
+  name: string
+  source_url: string
+  source_type: string
+  author: string
+  selection: Record<string, any>
+  options: Record<string, any>
+  schedule: Record<string, any>
+  schedule_text: string
+  enabled: boolean
+  auto_start: boolean
+  status: string
+  last_message: string
+  last_error: string
+  next_run_at: string | null
+  last_run_at: string | null
+  /** 后端已换算成本机时区的展示字符串（空串表示无） */
+  next_run_at_local: string
+  last_run_at_local: string
+  run_count: number
+  last_task_id: number | null
+  created_at: string
+  updated_at: string
+}
+
+export interface PlanRunResult {
+  ok: boolean
+  created: number
+  task_id: number | null
+  skipped?: number
+  message: string
+  candidates: {
+    video_id: string
+    title: string
+    duration: number
+    upload_date: string
+    taken: boolean
+  }[]
+}

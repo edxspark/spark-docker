@@ -11,8 +11,9 @@ const runtime = ref<RuntimeInfo | null>(null)
 const navItems = [
   { path: '/dashboard', title: '工作台', icon: 'Odometer' },
   { path: '/create', title: '新建搬运', icon: 'MagicStick' },
+  { path: '/plans', title: '搬运计划', icon: 'Calendar' },
   { path: '/tasks', title: '搬运管理', icon: 'List' },
-  { path: '/history', title: '任务历史', icon: 'Clock' },
+  { path: '/history', title: '搬运历史', icon: 'Clock' },
   { path: '/douyin', title: '抖音账号', icon: 'Promotion' },
   { path: '/settings', title: '系统配置', icon: 'Setting' },
 ]

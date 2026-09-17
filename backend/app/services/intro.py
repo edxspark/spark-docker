@@ -42,13 +42,22 @@ def card_mode(cfg: dict) -> str:
     return mode if mode in {"auto", "none", "custom"} else "auto"
 
 
+def resolve(cfg: dict) -> dict:
+    """按「实际是否生效」归一 enabled（与 IntroConfig.resolved 同一规则）。"""
+    resolved = dict(cfg or {})
+    resolved["enabled"] = bool(resolved.get("enabled", True)) and bool(
+        str(resolved.get("text") or "").strip()
+    )
+    return resolved
+
+
 def intro_config_key(cfg: dict) -> str:
     """开头语配置指纹：文案/停顿/开关任一变化，旧配音与旧字幕都要重做。
 
     标题卡也纳入指纹：换了卡片图或文案后重跑，成片必须重新渲染，
     否则会沿用上一次（旧卡片）的成片。
     """
-    settings = intro_settings(cfg)
+    settings = intro_settings(resolve(cfg))
     card = card_mode(cfg)
     card_detail = (
         f"{cfg.get('card_image', '')}|{cfg.get('card_title', '')}"

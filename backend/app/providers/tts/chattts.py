@@ -26,6 +26,19 @@ custom_voice / seed / voice 三种命名，让不同封装的字段名都能命�
 
 失败时给出可操作的诊断（服务没启动、路径不对、返回 JSON 报错等），
 因为「本地服务没起来」是最常见的情况。
+
+长文本的两处改造（参考 ChatTTS-LongAudio 的做法）
+-------------------------------------------------
+1. **文本归一化**：中文里混着的英文缩写、百分号、单位符号、中文冒号，
+   ChatTTS 经常读错甚至吞字（「AI创业」读成「哎创业」、「15.5%」读成「十五点五」）。
+   合成前先按规则表归一（见 services/tts_text.py），**只影响送进模型的文本**，
+   字幕与标题保持原样。
+2. **分片合成**：ChatTTS 单次推理的 token 上限有限，长句一次性合成容易在结尾
+   出现杂音/含糊。超过 `tts_chunk_chars`（默认 80 字）就切成多片分别合成，
+   每片先裁掉首尾静音再拼接——否则片与片之间会凭空多出近 1 秒死寂。
+
+另外兼容了「返回 JSON + 音频 URL」的服务端（LongAudio 的 /tts 就是这么返回的）：
+先把 URL 里的音频下载回来再落盘。
 """
 
 from __future__ import annotations
@@ -41,6 +54,7 @@ from pathlib import Path
 import httpx
 
 from app.providers.base import BaseTTS, ProviderError, SynthesisResult
+from app.services import tts_text
 from app.services.settings_store import TTSConfig
 from app.utils import ffmpeg as ffmpeg_utils
 from app.utils.text import split_for_tts
@@ -160,9 +174,34 @@ class ChatTTS(BaseTTS):
         finally:
             self.speaker_override = previous
 
+    def _prepare_text(self, text: str) -> str:
+        """合成前的文本处理：归一化（可关）→ 分片（由调用方按片长切）。
+
+        归一化只作用于「送给模型的文本」，不影响字幕内容。
+        """
+        if not bool(getattr(self.config, "normalize_text", True)):
+            return text
+        rules = tts_text.parse_term_rules(getattr(self.config, "term_rules", "") or "")
+        # 默认规则 + 用户自定义规则（自定义优先，长词优先）
+        merged = [*rules, *tts_text.DEFAULT_TERM_RULES]
+        merged.sort(key=lambda item: len(item[0]), reverse=True)
+        normalized = tts_text.normalize_for_tts(text, term_rules=merged)
+        if normalized and normalized != text:
+            logger.debug("ChatTTS 文本归一：%r → %r", text[:40], normalized[:40])
+        return normalized or text
+
+    def chunk_limit(self) -> int:
+        """单次请求的字数上限。
+
+        ChatTTS 用 `tts_chunk_chars`（默认 80）：长句一次推理容易在结尾糊掉。
+        其它封装（如只做整段推理的服务端）用公共的 `max_chars_per_request`。
+        """
+        return int(getattr(self.config, "tts_chunk_chars", 0) or self.config.max_chars_per_request)
+
     async def _synthesize_inner(self, text: str, out_path: Path) -> SynthesisResult:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        chunks = split_for_tts(text, self.config.max_chars_per_request)
+        prepared = self._prepare_text(text)
+        chunks = split_for_tts(prepared, self.chunk_limit())
         if not chunks:
             raise ProviderError("待合成文本为空")
 
@@ -206,7 +245,9 @@ class ChatTTS(BaseTTS):
             f"地址 {self.endpoint}；"
             f"说话人 {'种子 ' + str(speaker) + '（固定，全片同音色）' if speaker else '由服务端默认'}；"
             f"speed={self.config.speed} temperature={self.config.temperature} "
-            f"top_p={self.config.top_p} top_k={self.config.top_k}"
+            f"top_p={self.config.top_p} top_k={self.config.top_k}；"
+            f"单次上限 {self.chunk_limit()} 字"
+            f"（{'已开启' if bool(getattr(self.config, 'normalize_text', True)) else '未开启'}文本归一化）"
         )
         return f"{'服务可达' if reachable else '服务不可达'}（{note}）；{detail}"
 
@@ -342,6 +383,43 @@ class ChatTTS(BaseTTS):
             )
         return f"ChatTTS 返回 {response.status_code}：{snippet}"
 
+    async def _download_audio_url(self, url: str) -> bytes | None:
+        """从服务端返回的 URL 取回音频（LongAudio 的 /tts 返回 JSON + url）。
+
+        相对路径按 base_url 补全；下载失败返回 None，由调用方给出可读错误。
+        """
+        target = url.strip()
+        if not target:
+            return None
+        if target.startswith("/"):
+            target = f"{self.base_url}{target}"
+        elif not target.startswith(("http://", "https://")):
+            target = f"{self.base_url}/{target.lstrip('./')}"
+        try:
+            async with httpx.AsyncClient(timeout=self.config.timeout, follow_redirects=True) as client:
+                blob = await client.get(target)
+            if blob.status_code >= 400:
+                logger.warning("下载 ChatTTS 返回的音频失败：HTTP %s（%s）", blob.status_code, target)
+                return None
+            return blob.content
+        except Exception as exc:  # noqa: BLE001 - 取不回音频时走原有报错路径
+            logger.warning("下载 ChatTTS 返回的音频出错：%s（%s）", exc, target)
+            return None
+
+    @staticmethod
+    def _extract_payload_error(body: bytes) -> str | None:
+        """识别 {"code": 1, "msg": "..."} 这类业务错误。"""
+        try:
+            data = json.loads(body.decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        code = data.get("code")
+        if code in (None, 0, "0"):
+            return None
+        return str(data.get("msg") or data.get("message") or f"服务端返回 code={code}")
+
     async def _save(self, response: httpx.Response, out_path: Path) -> None:
         """把响应落盘：既支持直接返回音频，也支持 JSON 里带 base64。
 
@@ -356,6 +434,18 @@ class ChatTTS(BaseTTS):
             return
 
         if "json" in content_type or body[:1] in (b"{", b"["):
+            # 业务错误优先：{"code": 1, "msg": "..."} 比「不是音频」有信息量得多
+            payload_error = self._extract_payload_error(body)
+            if payload_error:
+                raise ProviderError(f"ChatTTS 服务端返回错误：{payload_error}")
+
+            # 有的服务端（如 ChatTTS-LongAudio）返回 JSON + 音频 URL，需要再取一次
+            for url in self._extract_urls_from_json(body):
+                blob = await self._download_audio_url(url)
+                if blob and _looks_like_audio(blob):
+                    await self._write_audio(blob, out_path, hinted_suffix=_suffix_for(blob))
+                    return
+
             blob = self._extract_audio_from_json(body)
             if blob is not None:
                 await self._write_audio(blob, out_path, hinted_suffix=_suffix_for(blob))
@@ -404,6 +494,31 @@ class ChatTTS(BaseTTS):
             ])
         finally:
             tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _extract_urls_from_json(body: bytes) -> list[str]:
+        """取出响应里可能的音频 URL（LongAudio：{"audio_files":[{"url": ...}]}）。"""
+        try:
+            data = json.loads(body.decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            return []
+
+        urls: list[str] = []
+        keys = {"url", "audio_url", "file_url", "path", "filename"}
+
+        def walk(node: object) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if isinstance(value, str) and key.lower() in keys and value.strip():
+                        urls.append(value.strip())
+                    else:
+                        walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(data)
+        return urls
 
     @staticmethod
     def _extract_audio_from_json(body: bytes) -> bytes | None:

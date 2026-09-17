@@ -3,6 +3,8 @@ import { ElMessage } from 'element-plus'
 import type {
   CancelAllResult,
   CreateTaskPayload,
+  PlanRecord,
+  PlanRunResult,
   DouyinAccount,
   Page,
   PipelineMeta,
@@ -168,6 +170,42 @@ export const youtubeApi = {
   check: () => http.post<{ ok: boolean; message: string }>('/youtube/check').then((r) => r.data),
 
   logout: () => http.post<{ message: string }>('/youtube/logout').then((r) => r.data),
+}
+
+// ---------------------------------------------------------------- 搬运计划
+
+export const planApi = {
+  meta: () =>
+    http
+      .get<{
+        scheduler: { running: boolean; busy: boolean; tick_seconds: number; last_tick: string | null }
+        schedule_types: { value: string; label: string }[]
+        selection_modes: { value: string; label: string }[]
+        weekdays: string[]
+        server_time: string
+        server_timezone: string
+      }>('/plans/meta')
+      .then((r) => r.data),
+
+  list: (params: { enabled?: boolean; q?: string; page?: number; page_size?: number }) =>
+    http.get<Page<PlanRecord>>('/plans', { params }).then((r) => r.data),
+
+  create: (payload: Record<string, any>) => http.post<PlanRecord>('/plans', payload).then((r) => r.data),
+
+  update: (id: number, payload: Record<string, any>) =>
+    http.put<PlanRecord>(`/plans/${id}`, payload).then((r) => r.data),
+
+  toggle: (id: number, enabled: boolean) =>
+    http.post<PlanRecord>(`/plans/${id}/toggle`, null, { params: { enabled } }).then((r) => r.data),
+
+  remove: (id: number) => http.delete<{ message: string }>(`/plans/${id}`).then((r) => r.data),
+
+  /** 手动跑一次；limit 只搬最新的 N 个，probeOnly 只解析不建任务 */
+  run: (id: number, payload: { probe_only?: boolean; limit?: number; ignore_uploaded?: boolean } = {}) =>
+    http.post<PlanRunResult>(`/plans/${id}/run`, payload, { timeout: 180000 }).then((r) => r.data),
+
+  history: (id: number, params?: { page?: number; page_size?: number }) =>
+    http.get<Page<Task>>(`/plans/${id}/history`, { params }).then((r) => r.data),
 }
 
 // ---------------------------------------------------------------- 统计

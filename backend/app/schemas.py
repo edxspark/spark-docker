@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models import STAGE_LABELS, STAGE_ORDER
 
@@ -207,3 +207,113 @@ class PublishItemRequest(BaseModel):
     # 重新发布：对「已发布过」的条目再上传一次。
     # 必须显式传 true——抖音不会因为重传而替换旧作品，否则会静默多出一个作品。
     republish: bool = False
+
+# --------------------------------------------------------------------------------------
+# 搬运计划
+# --------------------------------------------------------------------------------------
+
+
+class PlanCreateRequest(BaseModel):
+    name: str = ""
+    source_url: str = Field(min_length=5)
+    source_type: str = ""
+    author: str = ""
+    # 搬运范围：{"mode": ..., "count": N, "start": N, "end": N, "selected_video_ids": [...]}
+    selection: dict[str, Any] = Field(default_factory=dict)
+    options: dict[str, Any] = Field(default_factory=dict)
+    # 调度：{"type": "manual|interval|daily|weekly|once", ...}
+    schedule: dict[str, Any] = Field(default_factory=dict)
+    # 注意默认值必须是 True 而不是 None：前端通常不显式传这两个字段，
+    # 而 exclude_unset 会让 None 落到模型上，计划就变成「既没启用也没排期」
+    enabled: bool = True
+    auto_start: bool = True
+
+    @field_validator("source_url", "name")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        return (v or "").strip()
+
+
+class PlanUpdateRequest(PlanCreateRequest):
+    """更新计划：所有字段可选，未提供的不改动。"""
+
+    source_url: str | None = None  # type: ignore[assignment]
+    name: str | None = None  # type: ignore[assignment]
+
+
+class PlanOut(BaseModel):
+    """计划的对外表示。
+
+    `next_run_at` / `last_run_at` 在库里是"naive UTC"（与其它时间字段一致），
+    如果直接返回给前端，浏览器会把它当成本地时间解析，于是"每天 08:00"显示成
+    00:00（时区非 0 时整体偏移）。因此额外给出已经换算成本地时间的
+    `next_run_at_local` / `last_run_at_local`，前端直接用这两个字段展示。
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    source_url: str
+    source_type: str
+    author: str
+    selection: dict[str, Any] = Field(default_factory=dict)
+    options: dict[str, Any] = Field(default_factory=dict)
+    schedule: dict[str, Any] = Field(default_factory=dict)
+    schedule_text: str = ""
+    enabled: bool
+    auto_start: bool
+    status: str
+    last_message: str
+    last_error: str
+    next_run_at: datetime | None
+    last_run_at: datetime | None
+    run_count: int
+    last_task_id: int | None
+    created_at: datetime
+    updated_at: datetime
+    # 已换算成本机时区的展示用字符串（空字符串表示没有）
+    next_run_at_local: str = ""
+    last_run_at_local: str = ""
+
+    @staticmethod
+    def _local_text(value: datetime | None) -> str:
+        if value is None:
+            return ""
+        if value.tzinfo is None:
+            # 库里存的是 UTC，补上时区再转本地
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone().strftime("%Y-%m-%d %H:%M")
+
+    @model_validator(mode="after")
+    def _fill_local_text(self) -> PlanOut:
+        self.next_run_at_local = self._local_text(self.next_run_at)
+        self.last_run_at_local = self._local_text(self.last_run_at)
+        return self
+
+
+class PlanPageOut(BaseModel):
+    """计划列表分页（不能复用 PageOut：那个模型的 items 是 TaskOut）。"""
+
+    total: int
+    page: int
+    page_size: int
+    items: list[PlanOut] = Field(default_factory=list)
+
+
+class PlanRunRequest(BaseModel):
+    """手动执行一次；probe_only 只返回候选条目，不创建任务。"""
+
+    probe_only: bool = False
+    selected_video_ids: list[str] | None = Field(default=None, max_length=5000)
+    limit: int | None = Field(default=None, ge=1, le=500)
+    ignore_uploaded: bool | None = None
+
+
+class PlanRunResult(BaseModel):
+    ok: bool = True
+    created: int = 0
+    task_id: int | None = None
+    skipped: int = 0
+    message: str = ""
+    candidates: list[dict[str, Any]] = Field(default_factory=list)

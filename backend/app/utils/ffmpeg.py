@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.core.config import settings
-from app.utils import binaries
+from app.utils import binaries, procs
 
 
 class FFmpegError(RuntimeError):
@@ -50,21 +50,16 @@ async def _reap(proc: asyncio.subprocess.Process) -> None:
 
 
 async def _run(cmd: list[str], *, timeout: float | None = None) -> tuple[int, str, str]:
-    """执行外部命令，返回 (退出码, stdout, stderr)。超时会终止进程。"""
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    """执行外部命令，返回 (退出码, stdout, stderr)。超时会终止进程。
+
+    走 utils.procs：进程会登记到当前任务名下，因此取消任务时能被直接 kill，
+    而不是等这个阶段（可能几分钟的渲染）自然结束。
+    """
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+        code, stdout, stderr = await procs.run_process(cmd, timeout=timeout)
+    except TimeoutError:
         raise FFmpegError(f"命令超时（{timeout}s）: {' '.join(cmd[:3])} ...") from None
-    finally:
-        # 无论成功、超时还是被取消，都要确保子进程被回收，
-        # 否则会留下僵尸进程，并让传输对象在事件循环关闭后才被 GC（告警/句柄泄漏）。
-        await _reap(proc)
-    return proc.returncode or 0, stdout.decode("utf-8", "ignore"), stderr.decode("utf-8", "ignore")
+    return code, str(stdout), str(stderr)
 
 
 async def _run_bytes(cmd: list[str], *, timeout: float | None = None) -> tuple[int, bytes, str]:
@@ -73,18 +68,11 @@ async def _run_bytes(cmd: list[str], *, timeout: float | None = None) -> tuple[i
     必须单独提供：_run 会用 errors="ignore" 按 UTF-8 解码，用于二进制数据
     （例如 s16le PCM）时会静默丢弃大量字节——实测 610KB 的音频被削到 206KB。
     """
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+        code, stdout, stderr = await procs.run_process(cmd, timeout=timeout, text=False)
+    except TimeoutError:
         raise FFmpegError(f"命令超时（{timeout}s）: {' '.join(cmd[:3])} ...") from None
-    finally:
-        await _reap(proc)
-    return proc.returncode or 0, stdout or b"", (stderr or b"").decode("utf-8", "ignore")
+    return code, bytes(stdout), str(stderr)
 
 
 async def run_ffmpeg(args: list[str], *, timeout: float | None = 3600) -> None:

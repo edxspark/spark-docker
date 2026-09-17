@@ -483,7 +483,7 @@ onBeforeUnmount(() => {
   grid-template-columns: repeat(auto-fit, minmax(182px, 1fr));
 }
 
-/* 卡片外观由 @/components/MetricCard.vue 统一提供（与任务历史页共用） */
+/* 卡片外观由 @/components/MetricCard.vue 统一提供（与搬运历史页共用） */
 
 .two-col {
   display: grid;

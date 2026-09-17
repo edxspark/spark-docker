@@ -89,6 +89,9 @@ class Task(Base):
     # 任务选项：配音音色、是否发布、定时发布、翻译风格等
     options: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
+    # 来自哪个搬运计划（手动创建的任务为 None）
+    plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -203,3 +206,49 @@ class Setting(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     __table_args__ = (UniqueConstraint("key", name="uq_settings_key"),)
+
+
+class PlanStatus(str, enum.Enum):
+    IDLE = "idle"          # 待命（手动计划或等待到点）
+    RUNNING = "running"    # 正在创建/执行本次任务
+    ERROR = "error"        # 上次执行失败
+
+
+class Plan(Base):
+    """搬运计划：把「什么时候搬什么」预先存下来，到点自动建任务。
+
+    与 Task 的关系：计划本身不承载流水线，只在触发时创建 Task（可留痕 plan_id）。
+    """
+
+    __tablename__ = "plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(256), default="")
+    source_url: Mapped[str] = mapped_column(Text, default="")
+    source_type: Mapped[str] = mapped_column(String(32), default=SourceType.VIDEO.value)
+    author: Mapped[str] = mapped_column(String(256), default="")
+
+    # 搬运范围：{"mode": "all|first_n|latest|range", "count": N, "start": N, "page_size": N,
+    #           "selected_video_ids": [...], "ignore_uploaded": bool}
+    selection: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # 任务选项（音色、发布、画面等），与 Task.options 同结构
+    options: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # 调度：{"type": "manual|interval|daily|weekly|once", "minutes": N, "times": ["08:00"],
+    #        "weekdays": [0-6], "at": "ISO8601(UTC)"}
+    schedule: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    enabled: Mapped[bool] = mapped_column(default=True, index=True)
+    auto_start: Mapped[bool] = mapped_column(default=True)
+
+    status: Mapped[str] = mapped_column(String(32), default=PlanStatus.IDLE.value, index=True)
+    last_message: Mapped[str] = mapped_column(String(512), default="")
+    last_error: Mapped[str] = mapped_column(Text, default="")
+
+    # 下次触发时间（naive UTC；手动计划为 None）
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    run_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

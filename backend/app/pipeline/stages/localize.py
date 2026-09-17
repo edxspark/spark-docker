@@ -51,7 +51,9 @@ async def stage_translate(ctx: StageContext, state: ItemState) -> None:
     for cue, translated in zip(state.cues_en, result.texts, strict=True):
         text = normalize_punct((translated or cue.text).strip())
         cues_zh.append(Cue(start=cue.start, end=cue.end, text=text))
-    state.cues_zh = reindex(cues_zh)
+    # 这里拿到的是「正片译文」。如果 subtitle 是上一轮续跑带进来的（可能已经含开头语），
+    # 必须先按位移剔掉旧开头语，否则它会以普通句子的身份留在列表里被翻译一遍。
+    state.cues_zh = reindex(_drop_previous_intro(state, cues_zh))
 
     await _apply_intro(ctx, state)
 
@@ -113,56 +115,131 @@ def _intro_duration(state: ItemState) -> float:
     return max(0.0, float(state.cues_zh[0].duration) - gap)
 
 
+def intro_fitted(state: ItemState) -> bool:
+    """当前字幕里是否「真的」带着开头语。
+
+    只看 stats 不够可靠：中间某个阶段重建过字幕列表时，stats 与内容会不一致，
+    于是出现「记录说插过了、成片里却没有开头语」。这里以字幕内容为准，
+    并且额外比对首句文本——避免「上一轮是旧文案」被误判成已插入。
+    """
+    if not state.cues_zh:
+        return False
+    first = state.cues_zh[0]
+    if not intro_service.is_intro_cue(first):
+        return False
+    recorded_text = str((state.stats.get("intro") or {}).get("text") or "").strip()
+    return not recorded_text or first.text.strip() == recorded_text
+
+
+def intro_needs_redo(ctx: StageContext, state: ItemState) -> bool:
+    """开头语是否需要（重新）处理 —— 供 runner 判断 translate 阶段能否整段跳过。
+
+    开头语是在翻译阶段插进去的，所以只要它需要变化，translate 就不能跳过，
+    否则用户改了设置却永远不生效。
+    """
+    cfg = intro_service.resolve(ctx.config.merged("intro"))
+    settings = intro_service.intro_settings(cfg)
+    recorded = state.stats.get("intro") or {}
+
+    if not settings["enabled"]:
+        # 关掉开场白：只有「上一轮插过、还没撤」才需要再进一次
+        return bool(recorded.get("offset")) and recorded.get("mode") != "disabled"
+
+    if recorded.get("mode") == "disabled":
+        # 之前关过，现在又打开：需要重新插入
+        return True
+    if recorded.get("config_key") != intro_service.intro_config_key(cfg):
+        return True
+    # 指纹没变也要确认字幕里确实有它，否则这次要补上
+    return not intro_fitted(state)
+
+
+def _drop_previous_intro(state: ItemState, cues: list[Cue]) -> list[Cue]:
+    """把上一轮插入的开头语从「新翻译结果」里剔掉。
+
+    背景：`state.cues_zh` 在续跑时是从磁盘字幕恢复的（含开头语），而翻译阶段会整体
+    重建这个列表。若直接用新列表覆盖，开头语的统计记录还在、字幕却没了，
+    于是后续阶段认为「已经处理过」而跳过——最终成片既没有开头语配音，
+    字幕也被平移了一段空白（真实踩过：续跑后句子数从 6 掉到 5）。
+    """
+    recorded = (state.stats.get("intro") or {}).get("offset")
+    if not recorded:
+        return list(cues)
+    return intro_service.strip_by_offset(cues, float(recorded))
+
+
+def drop_intro(ctx: StageContext, state: ItemState) -> None:
+    """从当前字幕里去掉开头语，并把正片字幕移回原位。
+
+    优先按标记（同一次运行内重跑时标记还在），否则按 stats 记录的位移量判断
+    （续跑时 SRT 不保存标记，只能靠时间轴）。
+    """
+    if intro_service.has_intro(state.cues_zh):
+        state.cues_zh = reindex(intro_service.strip_intro(state.cues_zh))
+        return
+    recorded = float((state.stats.get("intro") or {}).get("offset") or 0.0)
+    if recorded > 0:
+        state.cues_zh = reindex(intro_service.strip_by_offset(state.cues_zh, recorded))
+
+
+def mark_intro_done(state: ItemState, *, key: str, settings: dict, mode: str, **extra) -> None:
+    """把开头语的处理结果写进 stats（同时也是「已处理」的凭据）。"""
+    state.stats["intro"] = {
+        "mode": mode,
+        "config_key": key,
+        "text": settings.get("text", ""),
+        "gap_seconds": settings.get("gap_seconds", 0.0),
+        "show_in_subtitle": bool(settings.get("show_in_subtitle", True)),
+        **extra,
+    }
+
+
 async def _apply_intro(ctx: StageContext, state: ItemState) -> None:
-    """把统一开头语插到字幕最前面，并把正片字幕整体后移。
+    """保证当前字幕里的开头语与配置一致（该加的加上、该换的换掉、该撤的撤掉）。
 
-    幂等的关键：判断「是否已经插过」只认 stats 里记录的配置指纹。
-    开头语标记写进 SRT 就会丢失，所以不能用标记或字幕内容判断。
-
-    时序说明：位移量需要「开头语的配音时长」，而这里还没合成音频，因此先按中文
-    语速估算；语音合成阶段拿到真实时长后修正开头语那条字幕（见 _fit_intro_cue）。
+    幂等性完全由这里负责，调用方（stage_translate）只管把「正片译文」准备好。
     """
     cfg = ctx.config.merged("intro")
     settings = intro_service.intro_settings(cfg)
     key = intro_service.intro_config_key(cfg)
     recorded = state.stats.get("intro") or {}
+    enabled = bool(settings["enabled"] and settings["text"])
 
-    if not settings["enabled"] or not settings["text"]:
-        # 关掉了开场白：把上一轮插进去的那条去掉，避免声音没了字幕还在
-        if recorded.get("offset"):
-            state.cues_zh = intro_service.strip_by_offset(state.cues_zh, float(recorded["offset"]))
-            state.cues_zh = reindex(state.cues_zh)
-            await ctx.reporter.log(
-                "已关闭统一开头语：本次成片开头不再播报，旧的结尾文案字幕一并移除",
-                stage="translate",
-                item_id=state.item.id,
-            )
-        state.stats.pop("intro", None)
+    # 1) 配置没变且字幕里确实有：什么都不用做
+    if recorded.get("config_key") == key and recorded.get("mode") != "disabled" and intro_fitted(state):
         return
 
-    if recorded.get("config_key") == key:
-        # 续跑且配置未变：开头语已经在字幕里，不重复插入
+    # 2) 需要撤掉旧的：开关关了，或者字幕里还留着上一轮的（文案/停顿变了）
+    if not enabled or intro_service.has_intro(state.cues_zh) or recorded.get("offset"):
+        had = intro_service.has_intro(state.cues_zh) or bool(recorded.get("offset"))
+        if had:
+            drop_intro(ctx, state)
+
+    if not enabled:
+        mark_intro_done(state, key=key, settings=settings, mode="disabled", offset=0.0)
+        await ctx.reporter.log(
+            "统一开头语已关闭：本次成片开头不再播报，旧的文案字幕一并移除",
+            stage="translate",
+            item_id=state.item.id,
+        )
         return
 
-    if recorded.get("offset"):
-        # 配置变了（换文案 / 改停顿）：先撤掉旧的，再插新的
-        state.cues_zh = intro_service.strip_by_offset(state.cues_zh, float(recorded["offset"]))
-
+    # 3) 插入新的开头语
     estimated = intro_service.estimate_duration(settings["text"])
-    offset = estimated + settings["gap_seconds"]
-    state.cues_zh = intro_service.apply_intro(state.cues_zh, settings, duration=estimated)
-    state.cues_zh = reindex(state.cues_zh)
-    state.stats["intro"] = {
-        "mode": "estimate",
-        "config_key": key,
-        "text": settings["text"],
-        "characters": len(settings["text"]),
-        "gap_seconds": settings["gap_seconds"],
-        "show_in_subtitle": settings["show_in_subtitle"],
-        "offset": round(offset, 3),
-    }
+    state.cues_zh = reindex(
+        intro_service.apply_intro(state.cues_zh, settings, duration=estimated)
+    )
+    mark_intro_done(
+        state,
+        key=key,
+        settings=settings,
+        mode="estimate",
+        characters=len(settings["text"]),
+        offset=round(estimated + settings["gap_seconds"], 3),
+    )
     await ctx.reporter.log(
-        f"已插入统一开头语（预计 {offset:.1f} 秒，含 {settings['gap_seconds']:.1f} 秒停顿）：{settings['text']}",
+        f"已插入统一开头语（预计 {estimated + settings['gap_seconds']:.1f} 秒，"
+        f"含 {settings['gap_seconds']:.1f} 秒停顿）：{settings['text']}",
         stage="translate",
         item_id=state.item.id,
     )
@@ -597,6 +674,10 @@ _TTS_KEY_FIELDS = (
     "top_k",
     "speed",
     "voice_seed",
+    # 文本预处理与分片：改了这两项，旧音频的读法与断句都会不同
+    "normalize_text",
+    "term_rules",
+    "tts_chunk_chars",
     # 性别匹配：策略或多音色偏好变化都会影响最终音色
     "voice_gender",
     "gender_fallback",

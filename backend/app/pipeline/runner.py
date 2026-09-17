@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from dataclasses import replace
 import time
 import traceback
 from collections.abc import Awaitable, Callable
@@ -27,6 +28,7 @@ from app.pipeline.context import (
 )
 from app.pipeline.stages.acquire import stage_download, stage_probe, stage_subtitle
 from app.pipeline.stages.deliver import stage_metadata, stage_publish
+from app.pipeline.stages import localize as localize_service
 from app.pipeline.stages.localize import (
     render_config_key,
     stage_align,
@@ -40,6 +42,7 @@ from app.providers.base import ProviderError
 from app.services import intro as intro_service
 from app.services.settings_store import merge_tts_config, settings_store
 from app.services.subtitles import normalize_cues, parse_subtitle_file, reindex
+from app.utils import procs
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +110,8 @@ class TaskHandle:
         self.task_id = task_id
         self.cancel_event = asyncio.Event()
         self.task: asyncio.Task | None = None
+        # 取消时要立刻给用户反馈，因此句柄持有 reporter
+        self.reporter: Reporter | None = None
 
     def cancel(self) -> None:
         self.cancel_event.set()
@@ -138,10 +143,24 @@ class TaskRunner:
         return [tid for tid, handle in self._handles.items() if handle.running]
 
     async def cancel(self, task_id: int) -> bool:
+        """取消任务：置位取消标志，并立刻杀掉该任务已启动的子进程。
+
+        只置位是不够的——阶段内部的 ffmpeg 渲染/下载可能还要跑几分钟，
+        用户看到的现象就是「取消了但还在跑」。杀掉子进程后，阶段会立刻
+        以 CancelledError 退出，任务状态随即落到已取消。
+        """
         handle = self._handles.get(task_id)
         if not handle or not handle.running:
             return False
         handle.cancel()
+        try:
+            killed = await procs.kill_task_processes(str(task_id))
+        except Exception:  # noqa: BLE001 - 清理失败不应影响取消本身
+            logger.exception("终止任务 %s 的子进程失败", task_id)
+            killed = 0
+        with contextlib.suppress(Exception):
+            await handle.reporter.task_update(message="正在取消…")
+        logger.info("任务 %s 已置取消标志（终止子进程 %s 个）", task_id, killed)
         return True
 
     async def submit(self, task_id: int) -> TaskHandle:
@@ -195,6 +214,7 @@ class TaskRunner:
             options=dict(task.options or {}),
         )
         reporter = Reporter(task_id, SessionLocal, handle.cancel_event)
+        handle.reporter = reporter
         account_file = settings.auth_dir / "douyin_default.json"
 
         try:
@@ -220,13 +240,23 @@ class TaskRunner:
         await reporter.log(f"任务开始执行，共 {len(items)} 个视频")
 
         slot = self._get_slot(int(general.get("max_concurrent_tasks", 1)))
-        async with slot:
-            await self._run_items(ctx, items, handle)
+        # 把该任务的子进程登记到 task_id 名下：取消时按任务杀进程
+        bind_token = procs.bind(str(task_id))
+        try:
+            async with slot:
+                await self._run_items(ctx, items, handle)
+            if handle.cancel_event.is_set():
+                raise TaskCanceled("任务已取消")
+        finally:
+            procs.unbind(bind_token)
+            await procs.kill_task_processes(str(task_id), reason="任务收尾清理")
 
         await self._finalize_from_items(task_id, reporter)
 
     async def _run_items(self, ctx: StageContext, items: list[TaskItem], handle: TaskHandle) -> None:
-        item_concurrency = max(1, settings.max_concurrent_items)
+        # 条目并发：系统配置优先（用户可调），未配置时用进程默认值
+        configured = ctx.config.general.get("max_concurrent_items") if ctx.config else None
+        item_concurrency = max(1, int(configured or settings.max_concurrent_items))
         semaphore = asyncio.Semaphore(item_concurrency)
         progress_lock = asyncio.Lock()
         item_progress: dict[int, float] = {item.id: 0.0 for item in items}
@@ -246,7 +276,36 @@ class TaskRunner:
                     return
                 await self._run_item(ctx, item, bump)
 
-        await asyncio.gather(*(run_one(item) for item in items), return_exceptions=False)
+        workers = [asyncio.create_task(run_one(item), name=f"item-{item.id}") for item in items]
+
+        async def watch_cancel() -> None:
+            """取消时立刻中断在跑的条目。
+
+            之前是「等条目自然结束」：如果正卡在一个 30 分钟的 ffmpeg 渲染上，
+            用户点了取消却要等半小时——这正是「取消无效」的主因。
+            现在改为真正 cancel 掉 worker：阶段内 await 的位置会立刻抛
+            CancelledError，登记的子进程也已由 TaskRunner.cancel 杀掉。
+            """
+            await handle.cancel_event.wait()
+            for worker in workers:
+                if not worker.done():
+                    worker.cancel()
+
+        watcher = asyncio.create_task(watch_cancel(), name="cancel-watcher")
+        try:
+            results = await asyncio.gather(*workers, return_exceptions=True)
+        finally:
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await watcher
+
+        # 取消时不再向外抛异常：交由 _run 判定后统一走「已取消」收尾，
+        # 避免聚合出的异常变成未处理异常（进程退出时打印一堆噪音）。
+        if handle.cancel_event.is_set():
+            return
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, TaskCanceled):
+                raise result
 
     async def _run_item(self, ctx: StageContext, item: TaskItem, bump) -> None:
         state = await self._build_state(ctx, item)
@@ -280,9 +339,12 @@ class TaskRunner:
             await self._log_item_summary(ctx, state, time.perf_counter() - item_started)
             await ctx.reporter.log(f"视频处理完成：{state.item.title_zh or state.item.title}", item_id=item_id)
 
-        except TaskCanceled:
-            await ctx.reporter.item_update(item_id, status=TaskStatus.CANCELED.value, message="已取消")
-            raise
+        except (TaskCanceled, asyncio.CancelledError):
+            # 子进程被杀掉时阶段会抛 CancelledError；这里统一按「已取消」处理，
+            # 绝不写成「条目失败」——否则用户会看到一堆取消导致的红点。
+            with contextlib.suppress(Exception):
+                await ctx.reporter.item_update(item_id, status=TaskStatus.CANCELED.value, message="已取消")
+            raise TaskCanceled("任务已取消")
         except Exception as exc:  # noqa: BLE001 - 单条失败不影响同任务其他条目
             message = str(exc)
             logger.exception("条目 %s 处理失败", item_id)
@@ -409,10 +471,10 @@ class TaskRunner:
     def _already_done(self, stage_name: str, state: ItemState, item: TaskItem, ctx: StageContext) -> bool:
         """断点续跑：已有产物则跳过已完成的阶段，避免重复下载/重复计费。"""
         paths = state.paths
-        # 上一次如果实跑过这个阶段，就直接跳过（probe 这类没有产物的阶段尤其依赖它）
-        if stage_name in (state.stats.get("stages_completed") or []):
-            return True
         if stage_name == "probe":
+            # probe 没有外部产物，只能看条目元信息；实跑过的标记是最可靠的依据
+            if stage_name in (state.stats.get("stages_completed") or []):
+                return True
             return bool(item.title and item.duration)
         if stage_name == "download":
             return paths.video.exists() and (bool(state.cues_en) or bool(state.stats.get("no_subtitle")))
@@ -427,7 +489,11 @@ class TaskRunner:
                 return bool(state.stats.get("asr_done"))
             return False
         if stage_name == "translate":
+            # 注意判断条件保留 subtitle_zh 的存在性：后面写文件用的是这个路径
             if not (paths.subtitle_zh.exists() and state.cues_zh):
+                return False
+            # 开头语配置变了必须再进一次这个阶段（它就是在这里插入的）
+            if localize_service.intro_needs_redo(ctx, state):
                 return False
             # 换了翻译服务/模型后，旧译文（可能是 mock 占位）必须重做
             if (state.stats.get("translate") or {}).get("config_key") != translate_config_key(ctx):
@@ -435,9 +501,7 @@ class TaskRunner:
             # 统一开头语是在这个阶段插进去的：文案/停顿/开关变了必须再进一次，
             # 否则改完设置重跑，字幕里还是上一轮的旧开场白（配音指纹变了、
             # 会重新合成，但字幕不会更新——这种「声画不一致」很难排查）
-            return (state.stats.get("intro") or {}).get("config_key") == intro_service.intro_config_key(
-                ctx.config.merged("intro")
-            )
+            return False if localize_service.intro_needs_redo(ctx, state) else True
         if stage_name == "tts":
             needed = len(state.cues_zh)
             if needed == 0:
@@ -532,23 +596,30 @@ class TaskRunner:
         # 统一开头语：标记写进 SRT 就会丢失，因此持久化的事实是 stats["intro"]。
         # 这里只在「恢复出来的字幕看起来带开头语、而 stats 又没有记录」时补一条，
         # 让下一次运行能识别并撤掉它（配置改了要重做，配置没变则不重复插入）。
-        intro_cfg = ctx.config.merged("intro")
+        intro_cfg = intro_service.resolve(ctx.config.merged("intro"))
         intro_settings = intro_service.intro_settings(intro_cfg)
         intro_stats = state.stats.get("intro") or {}
         if (
-            not intro_stats.get("offset")
-            and intro_settings["enabled"]
+            intro_settings["enabled"]
             and state.cues_zh
             and state.cues_zh[0].start < 0.35
+            and (state.cues_zh[0].text or "").strip() == str(intro_stats.get("text") or state.cues_zh[0].text).strip()
         ):
-            state.stats["intro"] = {
-                "mode": "restored",
-                "config_key": "",
-                "text": state.cues_zh[0].text,
-                "gap_seconds": intro_settings["gap_seconds"],
-                "show_in_subtitle": intro_settings["show_in_subtitle"],
-                "offset": round(state.cues_zh[0].end, 3),
-            }
+            # 续跑：SRT 里已经带着上一轮插入的开头语。
+            # 这里必须把标记补回 Cue 上 —— SRT 不保存标记，而后续阶段要靠标记
+            # 来判断「这条是开头语、别当正片处理」；缺了它，translate 阶段重建字幕
+            # 时开头语会被当成普通句子丢掉（真实踩过：续跑后 6 句变 5 句）。
+            first = state.cues_zh[0]
+            state.cues_zh[0] = replace(first, source_indexes=[*first.source_indexes, intro_service.INTRO_MARKER])
+            if not intro_stats.get("offset"):
+                state.stats["intro"] = {
+                    "mode": "restored",
+                    "config_key": "",
+                    "text": first.text,
+                    "gap_seconds": intro_settings["gap_seconds"],
+                    "show_in_subtitle": intro_settings["show_in_subtitle"],
+                    "offset": round(first.end, 3),
+                }
 
         return state
 

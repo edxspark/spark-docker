@@ -23,7 +23,20 @@ interface FieldMeta {
 const FIELD_META: Record<string, FieldMeta> = {
   // 通用
   'general.default_voice': { label: '默认配音音色', type: 'select', filterable: true, help: '新建任务时的默认阿里云发音人。实际可用性与音色列表以阿里云控制台开通情况为准' },
-  'general.max_concurrent_tasks': { label: '并发任务数', type: 'number', min: 1, max: 8, help: '同时执行的任务数量。过高会争抢带宽与 CPU，建议 1-2' },
+  'general.max_concurrent_tasks': {
+    label: '并发任务数',
+    type: 'number',
+    min: 1,
+    max: 8,
+    help: '同时执行几个任务（任务之间并行）。计划一次触发多个任务时，调大才不会排队；过高会争抢带宽与 CPU，建议 1-2',
+  },
+  'general.max_concurrent_items': {
+    label: '单任务内并发条目数',
+    type: 'number',
+    min: 1,
+    max: 8,
+    help: '同一个任务里同时处理几个视频（条目之间并行，需配合 TTS/下载并发）。实测 1→2、2→4 都能线性缩短总耗时，瓶颈通常在 CPU 与带宽',
+  },
   'general.keep_source_files': { label: '保留源文件', type: 'switch', help: '关闭后成片完成后删除下载的原视频以节省磁盘' },
   'general.log_retention_days': { label: '日志保留天数', type: 'number', min: 1, max: 365 },
   'general.auto_clean_failed': { label: '自动清理失败任务文件', type: 'switch' },
@@ -96,6 +109,23 @@ const FIELD_META: Record<string, FieldMeta> = {
   'tts_chattts.top_p': { label: 'top_p', type: 'number', min: 0.01, max: 1, step: 0.05, help: '采样范围，默认 0.7' },
   'tts_chattts.top_k': { label: 'top_k', type: 'number', min: 1, max: 200, help: '采样候选数，默认 20' },
   'tts_chattts.timeout': { label: '单次请求超时（秒）', type: 'number', min: 10, max: 1800, help: '首次合成本地模型需要加载，建议不少于 300 秒' },
+  'tts_chattts.tts_chunk_chars': {
+    label: '单次请求字数上限',
+    type: 'number',
+    min: 20,
+    max: 300,
+    help: '长文本会按这个长度切分成多片分别合成，再裁掉首尾静音拼接。ChatTTS 一次推理的 token 有限，长句结尾容易出现杂音/含糊，建议 60~90',
+  },
+  'tts_chattts.normalize_text': {
+    label: '文本归一化',
+    type: 'switch',
+    help: '合成前把英文缩写拆成字母（AI → A I）、百分号/单位/标点转成中文读法。只影响送进模型的文本，字幕与标题保持原样',
+  },
+  'tts_chattts.term_rules': {
+    label: '术语读法',
+    type: 'textarea',
+    help: '每行一条「原文=读法」，例如：抖音=抖音短视频。只写原文时按逐字母展开（如 ABC → A B C）。长词优先，用于修正模型读错的品牌名与专有名词',
+  },
   'tts_chattts.gender_pool_size': {
     label: '音色探测数量',
     type: 'number',

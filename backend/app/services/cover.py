@@ -23,34 +23,37 @@ logger = logging.getLogger(__name__)
 
 # 主题：底色渐变 + 强调色
 THEMES: dict[str, dict] = {
+    # 主色对齐应用主题色 #325AB4（深海军蓝 → 靛蓝），强调色只用一种蓝，
+    # 避免「蓝 + 紫 + 青」三种色相堆在一起显得杂。
     "tech_blue": {
-        "top": (10, 16, 32),
-        "bottom": (24, 46, 96),
-        "accent": (64, 158, 255),
-        "accent2": (127, 90, 240),
+        "top": (8, 14, 30),
+        "bottom": (22, 44, 92),
+        "accent": (110, 150, 240),
+        "accent2": (50, 90, 180),
     },
     "tech_dark": {
-        "top": (8, 10, 14),
-        "bottom": (26, 32, 44),
-        "accent": (0, 224, 184),
-        "accent2": (86, 204, 242),
+        "top": (7, 9, 13),
+        "bottom": (24, 30, 42),
+        "accent": (94, 204, 190),
+        "accent2": (42, 120, 130),
     },
     "minimal": {
-        "top": (18, 18, 20),
-        "bottom": (38, 38, 42),
-        "accent": (240, 240, 245),
-        "accent2": (170, 170, 180),
+        "top": (16, 17, 20),
+        "bottom": (34, 35, 40),
+        "accent": (238, 240, 245),
+        "accent2": (150, 156, 168),
     },
 }
 
 # 候选中文字体：优先思源黑体（有 Bold 字重），其次系统黑体
+# 只挑带 Bold 字重的黑体：封面标题需要足够粗才有「版式感」，
+# 宋体/细黑在深色底上会显得没精神。
 _FONT_CANDIDATES = (
     ("~/Library/Fonts/SourceHanSansCN-Bold.otf", 0),
     ("~/Library/Fonts/SourceHanSansCN-Medium.otf", 0),
     ("/System/Library/Fonts/STHeiti Medium.ttc", 0),
     ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
     ("/Library/Fonts/Arial Unicode.ttf", 0),
-    ("/System/Library/Fonts/Supplemental/Songti.ttc", 0),
 )
 
 
@@ -201,18 +204,17 @@ def build_thumbnail_cover(data: bytes, style: CoverStyle, out_path: Path) -> Pat
 
 
 def _tech_background(style: CoverStyle, *, seed: int = 0):
-    """纯生成式科技背景，完全不依赖视频画面。
+    """统一的科技感背景：单一主色渐变 + 一处光晕 + 点阵网格。
 
-    为什么不用视频截图：很多视频开头是纯黑或纯白帧，模糊后得到的是一张
-    黑底或白底，既难看又让文字失去对比度——「封面黑乎乎的」正是这么来的。
-    这里改用程序化绘制的抽象背景，任何视频都能得到稳定、干净的效果。
+    设计取舍（相对上一版）：上一版叠了「三层光晕 + 斜光带 + 线网格 + 暗角 + 颗粒」，
+    元素互相抢戏、画面发灰；这一版只保留三层，并且都压到很低的强度：
 
-    构成（全部克制，避免抢标题的视觉焦点）：
-      1. 深色纵向渐变打底；
-      2. 两到三团强调色光晕，位置由标题派生，因此不同视频略有差异但同一视频稳定；
-      3. 细网格 + 由上而下的淡出，提供科技感而不喧宾夺主；
-      4. 一道斜向光带，打破纯渐变的呆板；
-      5. 暗角 + 细颗粒，让画面更耐看、更有质感。
+      1. 深海军蓝纵向渐变（自上而下变亮，重心在下方的标题区）；
+      2. 右上角一团强调色光晕 —— 唯一的「光源」，给画面方向感；
+      3. 点阵网格 + 向下淡出 —— 点阵比线网格更克制，也更现代；
+      4. 很轻的暗角，只用来收边，不再整体压暗。
+
+    光晕位置由标题派生：同一视频稳定，不同视频略有差异。
     """
     import random
 
@@ -224,83 +226,47 @@ def _tech_background(style: CoverStyle, *, seed: int = 0):
 
     canvas = _vertical_gradient((width, height), palette["top"], palette["bottom"]).convert("RGB")
 
-    # ---- 强调色光晕 ----
-    # Image.radial_gradient 中心黑、边缘白，取反即得到中心亮的光晕蒙版
-    glow_mask_base = Image.radial_gradient("L").resize((width, height), Image.BILINEAR)
-    glow_mask_base = ImageChops.invert(glow_mask_base)
+    # ---- 唯一光源：右上角光晕 ----
+    screen = Image.radial_gradient("L").resize((width, height), Image.BILINEAR)
+    mask = ImageChops.invert(screen)
+    glow_w = int(width * rng.uniform(1.05, 1.25))
+    glow_h = int(height * rng.uniform(0.42, 0.55))
+    mask = mask.resize((max(8, glow_w), max(8, glow_h)), Image.BILINEAR)
+    # 强度刻意压低：光晕只负责「有光」，不该成为画面主体
+    mask = mask.point(lambda v: int(v * 0.42))
+    glow = Image.new("RGBA", mask.size, (*palette["accent"], 255))
+    glow.putalpha(mask)
+    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    layer.alpha_composite(glow, (width - glow_w + int(width * 0.18), -int(glow_h * 0.34)))
+    # 光晕边缘柔化，避免看到圆形边界
+    layer = layer.filter(ImageFilter.GaussianBlur(max(12, width // 40)))
+    canvas = Image.alpha_composite(canvas.convert("RGBA"), layer).convert("RGB")
 
-    glow_colors = [palette["accent"], palette["accent2"], palette["accent"]]
-    for index in range(3):
-        scale = rng.uniform(0.55, 0.95)
-        gw = int(width * scale)
-        gh = int(height * scale * rng.uniform(0.5, 0.8))
-        mask = glow_mask_base.resize((max(8, gw), max(8, gh)), Image.BILINEAR)
-        # 亮度：越靠后的光晕越弱，形成层次
-        strength = (110, 84, 62)[index]
-        mask = mask.point(lambda v, k=strength: min(255, int(v * k / 255)))
-        layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        color = glow_colors[index % len(glow_colors)]
-        patch = Image.new("RGBA", mask.size, (*color, 255))
-        patch.putalpha(mask)
-        x = int(rng.uniform(-gw * 0.25, width - gw * 0.5))
-        y = int(rng.uniform(-gh * 0.3, height - gh * 0.5))
-        layer.alpha_composite(patch, (max(0, x), max(0, y)) if x >= 0 and y >= 0 else (x, y))
-        canvas = Image.alpha_composite(canvas.convert("RGBA"), layer).convert("RGB")
-
-    # ---- 斜向光带 ----
-    band = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw_band = ImageDraw.Draw(band, "RGBA")
-    offset = int(height * 0.28)
-    draw_band.polygon(
-        [
-            (0, offset),
-            (width, offset - int(height * 0.16)),
-            (width, offset - int(height * 0.16) + int(height * 0.045)),
-            (0, offset + int(height * 0.045)),
-        ],
-        fill=(*palette["accent"], 26),
-    )
-    band = band.filter(ImageFilter.GaussianBlur(28))
-    canvas = Image.alpha_composite(canvas.convert("RGBA"), band).convert("RGB")
-
-    # ---- 细网格 + 纵向淡出 ----
+    # ---- 点阵网格 + 向下淡出 ----
     if style.show_grid:
         grid = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         draw_grid = ImageDraw.Draw(grid, "RGBA")
-        step = max(40, width // 16)
-        for x in range(0, width, step):
-            draw_grid.line([(x, 0), (x, height)], fill=(*palette["accent"], 16), width=1)
-        for y in range(0, height, step):
-            draw_grid.line([(0, y), (width, y)], fill=(*palette["accent"], 16), width=1)
-        # 越靠下越淡：把网格乘上一个纵向渐变蒙版
-        fade = _vertical_gradient((width, height), (255, 255, 255), (0, 0, 0)).convert("L")
+        step = max(46, width // 13)
+        dot = max(2, int(step * 0.055))
+        for x in range(step // 2, width, step):
+            for y in range(step // 2, height, step):
+                draw_grid.ellipse((x, y, x + dot, y + dot), fill=(*palette["accent"], 60))
+        fade = _vertical_gradient((width, height), (255, 255, 255), (28, 28, 28)).convert("L")
         grid.putalpha(ImageChops.multiply(grid.getchannel("A"), fade))
         canvas = Image.alpha_composite(canvas.convert("RGBA"), grid).convert("RGB")
 
-    # ---- 暗角 ----
-    vignette = ImageChops.invert(glow_mask_base.resize((width, height), Image.BILINEAR))
-    vignette = vignette.point(lambda v: int(v * 0.55))
-    dark = Image.new("RGB", (width, height), (0, 0, 0))
-    canvas = Image.composite(dark, canvas, vignette)
+    # ---- 轻暗角：收边用 ----
+    vignette = ImageChops.invert(screen.resize((width, height), Image.BILINEAR))
+    vignette = vignette.point(lambda v: int(v * 0.34))
+    canvas = Image.composite(Image.new("RGB", (width, height), (0, 0, 0)), canvas, vignette)
 
-    # ---- 细颗粒，避免大面积纯色显得廉价 ----
-    # 两个注意点：
-    #   1. ImageChops.add(im1, im2, scale) 的结果是 (im1+im2)/scale。
-    #      早先误用 scale=6.0，等于把整图亮度除以 6，封面严重发暗。改用 blend 混合，
-    #      blend 的 alpha 才是「颗粒强度」的正确表达方式。
-    #   2. 不用 Image.effect_noise：它不受我们的随机种子控制，会导致同一标题
-    #      每次生成不同封面。改为用受种子控制的随机字节，在低分辨率生成后放大，
-    #      既完全可复现，又比逐像素生成快得多。
-    grain_w = max(2, width // 4)
-    grain_h = max(2, height // 4)
+    # ---- 极轻颗粒，避免大面积渐变出现色带 ----
+    grain_w = max(2, width // 5)
+    grain_h = max(2, height // 5)
     grain_bytes = bytes(rng.getrandbits(8) for _ in range(grain_w * grain_h))
-    grain = Image.frombytes("L", (grain_w, grain_h), grain_bytes).resize(
-        (width, height), Image.BILINEAR
-    )
-    grain_rgb = Image.merge("RGB", (grain, grain, grain))
-    noisy = ImageChops.add(canvas, grain_rgb, scale=1.0, offset=-128)
-    canvas = Image.blend(canvas, noisy, 0.05)
-
+    grain = Image.frombytes("L", (grain_w, grain_h), grain_bytes).resize((width, height), Image.BILINEAR)
+    noisy = ImageChops.add(canvas, Image.merge("RGB", (grain, grain, grain)), scale=1.0, offset=-128)
+    canvas = Image.blend(canvas, noisy, 0.035)
     return canvas
 
 
@@ -418,6 +384,66 @@ def _wrap_title(text: str, font, max_width: int, max_lines: int = 3) -> list[str
     return lines[:max_lines]
 
 
+def _fit_title_font(title: str, style: CoverStyle, scale: float, max_width: int, max_lines: int = 3):
+    """按内容自适应字号：短标题放大（更有力量），长标题缩小（不溢出、不超行数）。
+
+    两个方向都要有，否则「3 个字的标题」和「39 个字的标题」用同一个字号，
+    前者会显得空、后者会挤——这正是封面看起来不精致的原因之一。
+    """
+    base = max(30, int(style.title_size * scale))
+
+    # 先试放大：只在「放大后仍不超行数」时采用，多行标题自然不会放大
+    candidate = base
+    for factor in (1.5, 1.38, 1.26, 1.14):
+        size = int(base * factor)
+        if len(_wrap_title(title, _load_font(size), max_width, max_lines)) <= 2:
+            candidate = size
+            break
+
+    for size in (candidate, int(candidate * 0.9), int(candidate * 0.8),
+                 int(candidate * 0.72), int(candidate * 0.64), int(candidate * 0.56)):
+        font = _load_font(max(26, size))
+        if len(_wrap_title(title, font, max_width, max_lines)) <= max_lines:
+            return font, size
+    fallback = max(26, int(base * 0.56))
+    return _load_font(fallback), fallback
+
+
+def _measure(draw, text: str, font) -> tuple[int, int]:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def _draw_eyebrow(draw, text: str, style: CoverStyle, palette: dict, x: int, y: int, scale: float) -> int:
+    """标题上方的极简标签：短竖条 + 小字，是全图唯一的「仪表盘」元素。"""
+    font = _load_font(max(16, int(28 * scale)))
+    bar_w = max(3, int(7 * scale))
+    bar_h = max(18, int(34 * scale))
+    draw.rounded_rectangle((x, y + int(2 * scale), x + bar_w, y + bar_h), radius=bar_w // 2,
+                           fill=(*palette["accent"], 255))
+    draw.text((x + bar_w + int(16 * scale), y), text, font=font, fill=(*palette["accent"], 235))
+    return y + bar_h
+
+
+def _draw_corner_ticks(draw, style: CoverStyle, palette: dict, margin: int, scale: float) -> None:
+    """四角短刻度线：很轻的一笔，提供「仪表/取景框」的科技暗示而不喧宾夺主。"""
+    length = int(38 * scale)
+    width = max(2, int(3 * scale))
+    color = (*palette["accent"], 120)
+    inset = int(34 * scale)
+    for cx, cy, dx, dy in (
+        (margin - inset, margin - inset, 1, 0),
+        (margin - inset, margin - inset, 0, 1),
+        (style.width - margin + inset, margin - inset, -1, 0),
+        (style.width - margin + inset, margin - inset, 0, 1),
+        (margin - inset, style.height - margin + inset, 1, 0),
+        (margin - inset, style.height - margin + inset, 0, -1),
+        (style.width - margin + inset, style.height - margin + inset, -1, 0),
+        (style.width - margin + inset, style.height - margin + inset, 0, -1),
+    ):
+        draw.line((cx, cy, cx + dx * length, cy + dy * length), fill=color, width=width)
+
+
 def generate_cover(
     *,
     video: Path | None,
@@ -428,7 +454,15 @@ def generate_cover(
     frame_at: float = 1.0,
     work_dir: Path | None = None,
 ) -> Path:
-    """生成封面并写入 out_path，返回该路径。"""
+    """生成统一版式的封面并写入 out_path。
+
+    版式固定为「上留白 + 下方文字块」的四层结构，任何标题长度都得到同一套骨架：
+        ① 顶部：品牌胶囊（左）
+        ② 中部：留白 + 单光源背景（让画面有呼吸感）
+        ③ 下部：eyebrow 小标签 → 大标题（自动折行/缩号）→ 标签胶囊行
+        ④ 底部：发丝分割线 + 品牌落款
+    这样不同视频的封面放在一起是「同一套设计」，而不是每张都在拼元素。
+    """
     from PIL import Image, ImageDraw
 
     style = style or CoverStyle()
@@ -436,116 +470,118 @@ def generate_cover(
     work_dir = work_dir or out_path.parent / "cover_work"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 基准缩放：所有尺寸按 1080x1920 等比换算
-    scale = style.height / 1920
-    margin = int(84 * scale)
-    title_size = max(24, int(style.title_size * scale))
-    tag_size = max(14, int(style.tag_size * scale))
+    # 基准缩放：所有尺寸按 1080x1440 竖版等比换算
+    scale = style.height / 1440
+    margin = int(96 * scale)
 
-    # 默认使用生成式背景：不依赖视频画面，避免开头是黑/白帧时得到黑底或白底封面
     from hashlib import sha1
 
     if style.background == "frame":
         background = _frame_background(video, style, frame_at, work_dir)
     else:
-        # 由标题派生随机种子：同一视频稳定，不同视频略有差异
         seed = int(sha1((title or "").encode("utf-8")).hexdigest()[:8], 16)
         background = _tech_background(style, seed=seed)
     canvas = Image.new("RGBA", (style.width, style.height), (0, 0, 0, 255))
     canvas.paste(background, (0, 0))
 
-    # 仅在使用视频截图作底图时才需要压暗——照片内容不可控，必须拉低亮度保证文字可读。
-    # 生成式背景本身已经是按「文字可读」设计的深色，再压一层会直接把画面涂黑：
-    # 早先无条件叠加一层 alpha=255 的纯色，实测把整图平均亮度从 52 压到 4，
-    # 封面看起来就是一片黑（这正是用户反馈的「黑乎乎」）。
+    # 用视频截图作底图时才压暗（生成式背景本身已按可读性设计，再压会发黑）
     if style.background == "frame":
-        overlay = Image.new(
-            "RGBA", (style.width, style.height), (*palette["bottom"], style.overlay_alpha)
-        )
+        overlay = Image.new("RGBA", (style.width, style.height), (*palette["bottom"], style.overlay_alpha))
         canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay)
 
     draw = ImageDraw.Draw(canvas, "RGBA")
 
+    # 底部文字区加一层很淡的黑色渐变，保证长标题换行时每一行都有对比度
+    scrim = Image.new("L", (style.width, int(style.height * 0.55)))
+    scrim.putdata([
+        int(200 * (i / max(1, scrim.height - 1)) ** 1.6)
+        for i in range(scrim.height)
+    ])
+    scrim_layer = Image.new("RGBA", (style.width, int(style.height * 0.55)), (0, 0, 0, 0))
+    scrim_layer.putalpha(scrim)
+    canvas.alpha_composite(scrim_layer, (0, style.height - scrim.height))
+
     if style.show_grid:
-        _draw_grid(draw, style, (*palette["accent"], 12))
+        _draw_corner_ticks(draw, style, palette, margin, scale)
 
-    # 顶部品牌胶囊
+    # ---- ① 顶部品牌胶囊 ----
     if style.brand:
-        brand_font = _load_font(max(16, int(30 * scale)))
-        bbox = draw.textbbox((0, 0), style.brand, font=brand_font)
-        bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        pad_x, pad_y = int(26 * scale), int(14 * scale)
-        box = (margin, margin, margin + bw + pad_x * 2, margin + bh + pad_y * 2 + int(6 * scale))
-        draw.rounded_rectangle(box, radius=(box[3] - box[1]) // 2,
-                               fill=(*palette["accent"], 38), outline=(*palette["accent"], 150), width=max(1, int(2 * scale)))
-        draw.text((box[0] + pad_x, box[1] + pad_y - bbox[1] + int(3 * scale)),
-                  style.brand, font=brand_font, fill=(*palette["accent"], 255))
+        brand_font = _load_font(max(16, int(26 * scale)))
+        bw, bh = _measure(draw, style.brand, brand_font)
+        pad_x, pad_y = int(24 * scale), int(13 * scale)
+        box = (margin, margin, margin + bw + pad_x * 2, margin + bh + pad_y * 2)
+        radius = (box[3] - box[1]) // 2
+        draw.rounded_rectangle(box, radius=radius, fill=(*palette["accent"], 26),
+                               outline=(*palette["accent"], 96), width=max(1, int(2 * scale)))
+        # 胶囊内左侧一个小圆点，作为「信号灯」细节
+        dot_r = max(3, int(7 * scale))
+        cy = (box[1] + box[3]) // 2
+        draw.ellipse((box[0] + pad_x, cy - dot_r, box[0] + pad_x + dot_r * 2, cy + dot_r),
+                     fill=(*palette["accent"], 255))
+        draw.text((box[0] + pad_x + dot_r * 2 + int(12 * scale), box[1] + pad_y - int(2 * scale)),
+                  style.brand, font=brand_font, fill=(255, 255, 255, 236))
 
-    # 标题：从下方三分之一处往上排版，保证竖版画面的视觉重心
-    title_font = _load_font(title_size)
-    lines = _wrap_title(title, title_font, style.width - margin * 2 - int(28 * scale))
-    line_height = int(title_size * 1.38)
-    tags_block = int(96 * scale) if (tags and style.max_tags) else int(20 * scale)
+    # ---- ③ 下部文字块（自下而上排版，保证始终贴住底部安全区）----
+    text_x = margin
+    text_max_w = style.width - margin * 2
+    title_font, title_size = _fit_title_font(title, style, scale, text_max_w)
+    lines = _wrap_title(title, title_font, text_max_w)
+    line_height = int(title_size * 1.32)
     title_block_h = line_height * len(lines)
-    title_top = style.height - int(430 * scale) - tags_block - title_block_h
 
-    if lines:
-        # 左侧强调竖条
-        bar_x = margin
-        bar_w = int(10 * scale)
-        draw.rounded_rectangle(
-            (bar_x, title_top + int(6 * scale), bar_x + bar_w, title_top + title_block_h - int(6 * scale)),
-            radius=bar_w // 2,
-            fill=(*palette["accent"], 255),
-        )
-        text_x = bar_x + bar_w + int(26 * scale)
-        for i, line in enumerate(lines):
-            y = title_top + i * line_height
-            # 轻微投影提升可读性
-            draw.text((text_x + int(2 * scale), y + int(3 * scale)), line, font=title_font,
-                      fill=(0, 0, 0, 130))
-            draw.text((text_x, y), line, font=title_font, fill=(255, 255, 255, 255))
+    chip_font = _load_font(max(16, int(26 * scale)))
+    chip_h = int(62 * scale)
+    chip_gap = int(14 * scale)
+    eyebrow_h = int(40 * scale)
 
-    # 标签胶囊
+    baseline = style.height - int(150 * scale)          # 底部落款线之上
+    chips_bottom = baseline - int(64 * scale)
+    chips_top = chips_bottom - chip_h
+    title_bottom = chips_top - int(46 * scale)
+    title_top = title_bottom - title_block_h
+    eyebrow_y = title_top - eyebrow_h - int(26 * scale)
+
+    eyebrow_text = "AI 译制 · 中文字幕" if style.brand else "AI 译制"
+    _draw_eyebrow(draw, eyebrow_text, style, palette, text_x, eyebrow_y, scale)
+
+    for index, line in enumerate(lines):
+        y = title_top + index * line_height
+        # 双层投影：深色底上纯白字容易「糊」，投影把字从背景里拎出来
+        draw.text((text_x + int(2 * scale), y + int(4 * scale)), line, font=title_font, fill=(0, 0, 0, 150))
+        draw.text((text_x, y), line, font=title_font, fill=(255, 255, 255, 255))
+
+    # ---- 标签胶囊行 ----
     if tags and style.max_tags:
-        tag_font = _load_font(tag_size)
-        x = margin
-        y = style.height - int(300 * scale)
-        drawn = 0
         shown = [t.strip().lstrip("#") for t in tags if t and t.strip()][: style.max_tags]
+        x = text_x
         for index, tag in enumerate(shown):
             label = f"#{tag}"
-            bbox = draw.textbbox((0, 0), label, font=tag_font)
-            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            pad_x, pad_y = int(20 * scale), int(11 * scale)
+            tw, _th = _measure(draw, label, chip_font)
+            pad_x = int(20 * scale)
             box_w = tw + pad_x * 2
             if x + box_w > style.width - margin and index > 0:
                 break
-            box = (x, y, x + box_w, y + th + pad_y * 2)
-            color = palette["accent"] if index % 2 == 0 else palette["accent2"]
-            draw.rounded_rectangle(box, radius=(box[3] - box[1]) // 2,
-                                   fill=(*color, 30), outline=(*color, 170), width=max(1, int(2 * scale)))
-            draw.text((x + pad_x, y + pad_y - bbox[1] + int(2 * scale)), label,
-                      font=tag_font, fill=(*color, 255))
-            x += box_w + int(16 * scale)
-            drawn += 1
-        remaining = len([t for t in tags if t and t.strip()]) - drawn
-        if remaining > 0 and x + int(120 * scale) < style.width - margin:
-            label = f"+{remaining}"
-            bbox = draw.textbbox((0, 0), label, font=tag_font)
-            box = (x, y, x + (bbox[2] - bbox[0]) + int(34 * scale), y + (bbox[3] - bbox[1]) + int(22 * scale))
-            draw.rounded_rectangle(box, radius=(box[3] - box[1]) // 2,
-                                   fill=(255, 255, 255, 18), outline=(255, 255, 255, 90),
-                                   width=max(1, int(2 * scale)))
-            draw.text((x + int(17 * scale), y + int(11 * scale) - bbox[1]), label,
-                      font=tag_font, fill=(255, 255, 255, 210))
+            box = (x, chips_top, x + box_w, chips_top + chip_h)
+            # 统一描边胶囊，不再按奇偶换色：多变体反而显得乱
+            draw.rounded_rectangle(box, radius=chip_h // 2, fill=(255, 255, 255, 16),
+                                   outline=(*palette["accent"], 120), width=max(1, int(2 * scale)))
+            draw.text((x + pad_x, chips_top + int(14 * scale)), label, font=chip_font,
+                      fill=(226, 234, 250, 240))
+            x += box_w + chip_gap
 
-    # 底部装饰线与品牌
-    y_bottom = style.height - int(120 * scale)
-    draw.line([(margin, y_bottom), (margin + int(140 * scale), y_bottom)],
-              fill=(*palette["accent"], 220), width=max(2, int(6 * scale)))
+    # ---- ④ 底部发丝线 + 落款 ----
+    line_y = style.height - int(120 * scale)
+    draw.line((margin, line_y, style.width - margin, line_y), fill=(255, 255, 255, 40),
+              width=max(1, int(2 * scale)))
+    draw.line((margin, line_y, margin + int(150 * scale), line_y), fill=(*palette["accent"], 235),
+              width=max(2, int(5 * scale)))
+    footer_font = _load_font(max(14, int(22 * scale)))
+    footer = "中文字幕 · AI 配音"
+    fw, _fh = _measure(draw, footer, footer_font)
+    draw.text((style.width - margin - fw, line_y + int(22 * scale)), footer, font=footer_font,
+              fill=(255, 255, 255, 120))
 
-    canvas.convert("RGB").save(out_path, "JPEG", quality=92)
+    canvas.convert("RGB").save(out_path, "JPEG", quality=93)
     return out_path
 
 

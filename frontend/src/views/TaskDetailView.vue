@@ -190,6 +190,9 @@ async function handleCancel() {
   try {
     const result = await taskApi.cancel(taskId.value)
     ElMessage.success(result.message)
+    // 取消现在是「立刻中断」：刷新一次就能看到任务已停止（或正在取消…），
+    // 否则页面还停在旧状态，用户会以为没生效而反复点。
+    reload().catch(() => undefined)
   } catch {
     /* 拦截器已提示 */
   }
