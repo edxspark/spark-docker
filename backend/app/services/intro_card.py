@@ -34,13 +34,28 @@ _SAFE_RATIO = 0.84
 _VERTICAL_BIAS = 0.43
 _MAX_CARD_PX = 3840  # 单边像素上限，防止 4K 竖屏生成超大 PNG
 
-# 科技感配色：深空蓝底 + 青蓝渐变主色
-_BG_TOP = "#070b16"
-_BG_BOTTOM = "#0d1730"
-_ACCENT = "#5eead4"  # 青
-_ACCENT_2 = "#3b6ef5"  # 品牌蓝
-_TEXT = "#eaf2ff"
-_TEXT_DIM = "#93a4c4"
+# 配色。
+#
+# 用户反馈「配色不好看」，实测定位到三个具体问题：
+#   1. 底色太暗：原 #070b16 → #0d1730 在成图上主色亮度只有 0.007，两级渐变几乎看不出
+#      差别，整张卡读起来就是「一片黑」，光晕也因为没有基底落差而糊成一团；
+#   2. 青(#5eead4) + 蓝(#3b6ef5) 是 AI/科技类视频里最烂大街的一组配色，看着廉价；
+#   3. 文字 #eaf2ff / #93a4c4 都偏冷，叠在冷底上整体发灰、发闷。
+# 改为：底色抬到渐变可见，强调色换成暖琥珀（品牌名 EdxSpark 的 Spark 本就偏暖），
+# 冷底 + 暖强调在视频里前后层次更清楚，也不容易和满屏青色科技风撞车。
+# 想换方向只改下面这几行即可，例如冷色系：_ACCENT="#60a5fa"、_ACCENT_2="#a78bfa"。
+_BG_TOP = "#131e3a"
+_BG_MID = "#0d1628"
+_BG_BOTTOM = "#080d18"
+# 底色柔光专用色：只做深浅层次，刻意与底色同族。
+# 事故：一开始把暖色光晕铺在冷底上，两种色相混合后去饱和——实测右上角变成
+# #292829 的中性灰、左下角变成 #301f22 的暗红褐，色相全丢了，画面发闷。
+# 结论：柔光只用同族色，"暖"要靠实心色块去给，不要靠混色。
+_GLOW = "#2f5bd0"
+_ACCENT = "#ffb454"  # 琥珀金
+_ACCENT_2 = "#ff7a59"  # 暖橙，与琥珀同族，渐变不脏
+_TEXT = "#f7f9ff"
+_TEXT_DIM = "#b3c0d8"
 
 # 可用版式：hero（左对齐片头）/ frame（居中画框）/ band（竖排强调块）
 LAYOUTS = ("hero", "frame", "band")
@@ -161,27 +176,56 @@ def _esc(value: str) -> str:
     )
 
 
+def _type_scale(height: int) -> dict[str, float]:
+    """按画面高度推导各级字号。
+
+    为什么不能再用原来的 `scale = min(width/1080, height/1920)`：
+    基数是竖屏 1080×1920，遇到横屏 1920×1080 时这个系数取 min(1.78, 0.5625) = 0.5625，
+    **所有字号被整体压到 56%**——实测成图上左上角品牌字只有 16px、副标题 22.5px，
+    分别只占画面高的 1.5% 和 2.1%，在手机上看基本读不出来。
+
+    字号只应与**画面高度**相关（观众看到的是画面高度映射到屏幕高度），
+    并且取值要比原设计更大：实测原来是连竖屏都偏小。
+    上限用 1920 兜底，避免竖屏 4K 时字大到溢出安全区。
+    """
+    h = min(float(height), 1920.0)
+    return {
+        # 左上角品牌字：画面高的 3%，至少 24px
+        "eyebrow": max(24.0, min(0.030 * h, 58.0)),
+        # 副标题：4.8%，至少 34px（原来只有 2.1%，是用户点名的「太小」）
+        "subtitle": max(34.0, min(0.048 * h, 88.0)),
+        # 主标题起始 / 下限
+        "title": max(72.0, min(0.115 * h, 200.0)),
+        "title_min": max(46.0, min(0.066 * h, 104.0)),
+    }
+
+
 def _defs(scale: float, width: int, height: int) -> str:
-    """公共 defs：底色渐变、光晕、强调色渐变、极淡网格。"""
-    grid = max(72.0, 120.0 * scale)
+    """公共 defs：底色渐变、柔光、强调色渐变、分隔线。
+
+    这里删掉了原来的网格纹理（每 120px 一格的浅蓝细线）：它在成片上只是噪点，
+    而且是「科技风模板」最明显的标志之一，正是用户觉得难看的原因之一。
+    """
     return (
         "<defs>"
-        '<linearGradient id="bg" x1="0.1" y1="0" x2="0.9" y2="1">'
+        '<linearGradient id="bg" x1="0.08" y1="0" x2="0.92" y2="1">'
         f'<stop offset="0" stop-color="{_BG_TOP}"/>'
-        '<stop offset="0.5" stop-color="#0a1122"/>'
+        f'<stop offset="0.52" stop-color="{_BG_MID}"/>'
         f'<stop offset="1" stop-color="{_BG_BOTTOM}"/>'
         "</linearGradient>"
         '<linearGradient id="bg2" x1="0" y1="0" x2="0" y2="1">'
-        '<stop offset="0" stop-color="#0a1428"/>'
-        '<stop offset="1" stop-color="#060a14"/>'
+        f'<stop offset="0" stop-color="{_BG_TOP}"/>'
+        f'<stop offset="1" stop-color="{_BG_BOTTOM}"/>'
         "</linearGradient>"
-        '<radialGradient id="glowBlue" cx="0.5" cy="0.5" r="0.5">'
-        f'<stop offset="0" stop-color="{_ACCENT_2}" stop-opacity="0.5"/>'
-        f'<stop offset="1" stop-color="{_ACCENT_2}" stop-opacity="0"/>'
+        '<radialGradient id="glowA" cx="0.5" cy="0.5" r="0.5">'
+        f'<stop offset="0" stop-color="{_GLOW}" stop-opacity="0.46"/>'
+        f'<stop offset="0.55" stop-color="{_GLOW}" stop-opacity="0.15"/>'
+        f'<stop offset="1" stop-color="{_GLOW}" stop-opacity="0"/>'
         "</radialGradient>"
-        '<radialGradient id="glowTeal" cx="0.5" cy="0.5" r="0.5">'
-        f'<stop offset="0" stop-color="{_ACCENT}" stop-opacity="0.4"/>'
-        f'<stop offset="1" stop-color="{_ACCENT}" stop-opacity="0"/>'
+        '<radialGradient id="glowB" cx="0.5" cy="0.5" r="0.5">'
+        f'<stop offset="0" stop-color="{_GLOW}" stop-opacity="0.26"/>'
+        f'<stop offset="0.5" stop-color="{_GLOW}" stop-opacity="0.07"/>'
+        f'<stop offset="1" stop-color="{_GLOW}" stop-opacity="0"/>'
         "</radialGradient>"
         '<linearGradient id="accentBar" x1="0" y1="0" x2="1" y2="0">'
         f'<stop offset="0" stop-color="{_ACCENT}"/>'
@@ -191,10 +235,14 @@ def _defs(scale: float, width: int, height: int) -> str:
         f'<stop offset="0" stop-color="{_TEXT}" stop-opacity="0.55"/>'
         f'<stop offset="1" stop-color="{_TEXT}" stop-opacity="0.08"/>'
         "</linearGradient>"
-        f'<pattern id="grid" width="{grid:.1f}" height="{grid:.1f}" patternUnits="userSpaceOnUse">'
-        f'<path d="M {grid:.1f} 0 L 0 0 0 {grid:.1f}" fill="none" stroke="#8ecbff" '
-        f'stroke-opacity="0.055" stroke-width="{max(1.0, scale):.2f}"/>'
-        "</pattern>"
+        # 上下压暗：让画面有收束感、文字块不「浮」在中间。
+        # 实测 0.42 会把右下角压到亮度 0.0034（比修改前的一片死黑还黑），所以减半。
+        '<linearGradient id="vignette" x1="0" y1="0" x2="0" y2="1">'
+        '<stop offset="0" stop-color="#000000" stop-opacity="0.16"/>'
+        '<stop offset="0.24" stop-color="#000000" stop-opacity="0"/>'
+        '<stop offset="0.76" stop-color="#000000" stop-opacity="0"/>'
+        '<stop offset="1" stop-color="#000000" stop-opacity="0.26"/>'
+        "</linearGradient>"
         "</defs>"
     )
 
@@ -225,45 +273,73 @@ def _title_font(
 def _layout_hero(
     *, width: int, height: int, title: str, subtitle: str, font: str, brand: str, scale: float
 ) -> list[str]:
-    """左对齐的大标题片头：顶部强调条 + 品牌字，左下标题块，底部进度轨。"""
+    """左对齐的大标题片头：暖色强调条 + 品牌字，左下标题块，底部进度轨。
+
+    这一版重排的要点（对应「难看」+「字太小」两条反馈）：
+      - 去掉网格纹理与两处大光晕：它们叠加后只是在深色上糊出一片脏雾；
+        改成「单一柔光 + 上下压暗」，画面干净、中心有落点；
+      - 三级字号的差距重新拉开（品牌 3% / 副标题 4.8% / 标题 11.5% 画面高），
+        层级靠字号和字重区分，不再靠压暗颜色——压暗只会显得脏；
+      - 强调条从「细线」加粗成有存在感的色块，作为唯一的暖色落点。
+    """
+    t = _type_scale(height)
     margin = width * 0.085
     parts: list[str] = []
 
-    # 背景：极深底 + 两处斜向光晕 + 极淡网格
+    # 背景：抬亮的深墨蓝渐变 + 柔光 + 上下压暗。
+    # 主柔光刻意压在**标题块后面**（而不是画面角落）：实测原来的排法让文字落在
+    # 全画面最暗处（亮度 0.0087），四个角反而更亮，层次是反的——文字像陷进一个黑洞。
+    # 让文字坐在一块微微抬亮的底上，既拉开层次，又不用加色块或描边。
     parts.append(f'<rect width="{width}" height="{height}" fill="url(#bg)"/>')
-    parts.append(f'<rect width="{width}" height="{height}" fill="url(#grid)"/>')
     parts.append(
-        f'<ellipse cx="{width * 0.78:.0f}" cy="{height * 0.18:.0f}" rx="{width * 0.72:.0f}" '
-        f'ry="{height * 0.22:.0f}" fill="url(#glowBlue)"/>'
+        f'<ellipse cx="{width * 0.30:.0f}" cy="{height * 0.54:.0f}" rx="{width * 0.56:.0f}" '
+        f'ry="{height * 0.42:.0f}" fill="url(#glowA)"/>'
     )
     parts.append(
-        f'<ellipse cx="{width * 0.12:.0f}" cy="{height * 0.86:.0f}" rx="{width * 0.6:.0f}" '
-        f'ry="{height * 0.18:.0f}" fill="url(#glowTeal)"/>'
+        f'<ellipse cx="{width * 0.88:.0f}" cy="{height * 0.12:.0f}" rx="{width * 0.34:.0f}" '
+        f'ry="{height * 0.22:.0f}" fill="url(#glowB)"/>'
     )
+    parts.append(f'<rect width="{width}" height="{height}" fill="url(#vignette)"/>')
 
-    # 顶部：一条强调短线 + 品牌字（大写、宽字距）
+    # 顶部：一块强调色块 + 品牌字（字距拉开，读起来像刊头）
     top_y = height * 0.115
-    bar_w = 76 * scale
-    bar_h = max(3.0, 5.0 * scale)
+    bar_w = 58 * (t["eyebrow"] / 32.0)
+    bar_h = max(5.0, t["eyebrow"] * 0.30)
     parts.append(
-        f'<rect x="{margin:.1f}" y="{top_y:.1f}" width="{bar_w:.1f}" height="{bar_h:.1f}" '
-        f'rx="{bar_h / 2:.2f}" fill="url(#accentBar)"/>'
+        f'<rect x="{margin:.1f}" y="{top_y - bar_h * 0.62:.1f}" width="{bar_w:.1f}" '
+        f'height="{bar_h:.1f}" rx="{bar_h * 0.32:.2f}" fill="url(#accentBar)"/>'
     )
     parts.append(
-        f'<text x="{margin + bar_w + 26 * scale:.1f}" y="{top_y + bar_h * 0.9:.1f}" '
-        f'{_title_font(anchor="start", size=27 * scale, font=font, fill=_TEXT_DIM, scale=scale, bold=False, letter_spacing=5 * scale)}>{_esc(brand.upper())}</text>'
+        f'<text x="{margin + bar_w + t["eyebrow"] * 0.72:.1f}" '
+        f'y="{top_y + t["eyebrow"] * 0.34:.1f}" '
+        f'{_title_font(anchor="start", size=t["eyebrow"], font=font, fill=_TEXT, scale=scale, bold=True, letter_spacing=t["eyebrow"] * 0.22)}>{_esc(brand.upper())}</text>'
     )
 
     title_size, title_lines = _fit_size(
-        title or _TITLE_DEFAULT, max_width=width - margin * 2, start=132 * scale, min_size=46 * scale
+        title or _TITLE_DEFAULT,
+        max_width=width - margin * 2,
+        start=t["title"],
+        min_size=t["title_min"],
     )
     sub_size, sub_lines = _fit_size(
-        subtitle or _SUBTITLE_DEFAULT, max_width=width - margin * 2, start=42 * scale, min_size=26 * scale, max_lines=2
+        subtitle or _SUBTITLE_DEFAULT,
+        max_width=width - margin * 2,
+        start=t["subtitle"],
+        min_size=t["subtitle"] * 0.82,
+        max_lines=2,
     )
 
-    title_lh = title_size * 1.18
-    block_h = len(title_lines) * title_lh + 40 * scale + len(sub_lines) * sub_size * 1.5
-    y = height * 0.56 - block_h / 2
+    title_lh = title_size * 1.16
+    gap = title_size * 0.34
+    rule_h = max(3.0, title_size * 0.035)
+    block_h = (
+        len(title_lines) * title_lh
+        + gap
+        + rule_h
+        + sub_size * 1.1
+        + len(sub_lines) * sub_size * 1.42
+    )
+    y = height * 0.555 - block_h / 2
 
     for line in title_lines:
         parts.append(
@@ -273,28 +349,30 @@ def _layout_hero(
         )
         y += title_lh
 
-    y += 18 * scale
+    y += gap
+    # 标题与副标题之间用暖色短线分隔：唯一的暖色落点，代替原来那片浑浊的光晕
     parts.append(
-        f'<rect x="{margin:.1f}" y="{y:.1f}" width="{width * 0.24:.1f}" '
-        f'height="{max(1.6, 2.4 * scale):.2f}" fill="url(#accentBar)" opacity="0.85"/>'
+        f'<rect x="{margin:.1f}" y="{y:.1f}" width="{width * 0.12:.1f}" '
+        f'height="{rule_h:.2f}" rx="{rule_h / 2:.2f}" fill="url(#accentBar)"/>'
     )
-    y += 40 * scale
+    y += rule_h + sub_size * 1.1
     for line in sub_lines:
         parts.append(
             f'<text x="{margin:.1f}" y="{y:.1f}" '
-            f'{_title_font(anchor="start", size=sub_size, font=font, fill=_TEXT_DIM, scale=scale, bold=False, letter_spacing=1.6 * scale)}>{_esc(line)}</text>'
+            f'{_title_font(anchor="start", size=sub_size, font=font, fill=_TEXT_DIM, scale=scale, bold=False, letter_spacing=sub_size * 0.06)}>{_esc(line)}</text>'
         )
-        y += sub_size * 1.5
+        y += sub_size * 1.42
 
-    # 底部进度轨：暗示"正在开始"，也让静止画面有方向感
-    track_y = height * 0.865
+    # 底部进度轨：暗示「正在开始」，也让静止画面有方向感
+    track_y = height * 0.875
+    track_h = max(3.0, height * 0.005)
     parts.append(
         f'<rect x="{margin:.1f}" y="{track_y:.1f}" width="{width - margin * 2:.1f}" '
-        f'height="{max(2.0, 3.0 * scale):.2f}" rx="2" fill="{_TEXT}" opacity="0.12"/>'
+        f'height="{track_h:.2f}" rx="{track_h / 2:.2f}" fill="{_TEXT}" opacity="0.16"/>'
     )
     parts.append(
         f'<rect x="{margin:.1f}" y="{track_y:.1f}" width="{(width - margin * 2) * 0.32:.1f}" '
-        f'height="{max(2.0, 3.0 * scale):.2f}" rx="2" fill="url(#accentBar)"/>'
+        f'height="{track_h:.2f}" rx="{track_h / 2:.2f}" fill="url(#accentBar)"/>'
     )
     return parts
 
@@ -303,20 +381,22 @@ def _layout_frame(
     *, width: int, height: int, title: str, subtitle: str, font: str, brand: str, scale: float
 ) -> list[str]:
     """居中构图 + 多层细线画框：稳、干净，像知识类频道的片头。"""
+    t = _type_scale(height)
     parts: list[str] = []
     parts.append(f'<rect width="{width}" height="{height}" fill="url(#bg2)"/>')
     parts.append(
         f'<ellipse cx="{width / 2:.0f}" cy="{height * 0.44:.0f}" rx="{width * 0.66:.0f}" '
-        f'ry="{height * 0.3:.0f}" fill="url(#glowBlue)"/>'
+        f'ry="{height * 0.3:.0f}" fill="url(#glowA)"/>'
     )
     parts.append(
         f'<ellipse cx="{width / 2:.0f}" cy="{height * 0.62:.0f}" rx="{width * 0.5:.0f}" '
-        f'ry="{height * 0.22:.0f}" fill="url(#glowTeal)"/>'
+        f'ry="{height * 0.22:.0f}" fill="url(#glowB)"/>'
     )
+    parts.append(f'<rect width="{width}" height="{height}" fill="url(#vignette)"/>')
 
     # 三层同心细框：最外层几乎不可见，向内逐渐清晰
     inset = width * 0.06
-    for index, (alpha, pad) in enumerate(((0.10, 0.0), (0.18, 26 * scale), (0.30, 52 * scale))):
+    for _index, (alpha, pad) in enumerate(((0.10, 0.0), (0.18, 26 * scale), (0.30, 52 * scale))):
         x = inset + pad
         w = width - (inset + pad) * 2
         h = height - (inset + pad) * 2
@@ -337,10 +417,10 @@ def _layout_frame(
 
     margin = width * 0.12
     title_size, title_lines = _fit_size(
-        title or _TITLE_DEFAULT, max_width=width - margin * 2, start=124 * scale, min_size=44 * scale
+        title or _TITLE_DEFAULT, max_width=width - margin * 2, start=t["title"], min_size=t["title_min"]
     )
     sub_size, sub_lines = _fit_size(
-        subtitle or _SUBTITLE_DEFAULT, max_width=width - margin * 2, start=40 * scale, min_size=25 * scale, max_lines=2
+        subtitle or _SUBTITLE_DEFAULT, max_width=width - margin * 2, start=t["subtitle"], min_size=t["subtitle"] * 0.82, max_lines=2
     )
 
     title_lh = title_size * 1.24
@@ -376,7 +456,7 @@ def _layout_frame(
 
     parts.append(
         f'<text x="{width / 2:.1f}" y="{height - width * 0.06 - 30 * scale:.1f}" '
-        f'{_title_font(anchor="middle", size=24 * scale, font=font, fill=_TEXT_DIM, scale=scale, bold=False, letter_spacing=6 * scale)} '
+        f'{_title_font(anchor="middle", size=t["eyebrow"], font=font, fill=_TEXT, scale=scale, bold=True, letter_spacing=t["eyebrow"] * 0.22)} '
         f'opacity="0.75">{_esc(brand.upper())}</text>'
     )
     return parts
@@ -386,9 +466,9 @@ def _layout_band(
     *, width: int, height: int, title: str, subtitle: str, font: str, brand: str, scale: float
 ) -> list[str]:
     """左侧竖排强调块 + 右下错落标题：设计感最强，适合品牌片头。"""
+    t = _type_scale(height)
     parts: list[str] = []
     parts.append(f'<rect width="{width}" height="{height}" fill="url(#bg)"/>')
-    parts.append(f'<rect width="{width}" height="{height}" fill="url(#grid)"/>')
 
     # 右上大面积深色斜切块，制造前后层次
     parts.append(
@@ -397,12 +477,13 @@ def _layout_band(
     )
     parts.append(
         f'<ellipse cx="{width * 0.86:.0f}" cy="{height * 0.72:.0f}" rx="{width * 0.6:.0f}" '
-        f'ry="{height * 0.24:.0f}" fill="url(#glowBlue)"/>'
+        f'ry="{height * 0.24:.0f}" fill="url(#glowA)"/>'
     )
     parts.append(
         f'<ellipse cx="{width * 0.2:.0f}" cy="{height * 0.3:.0f}" rx="{width * 0.5:.0f}" '
-        f'ry="{height * 0.2:.0f}" fill="url(#glowTeal)"/>'
+        f'ry="{height * 0.2:.0f}" fill="url(#glowB)"/>'
     )
+    parts.append(f'<rect width="{width}" height="{height}" fill="url(#vignette)"/>')
 
     # 左侧竖排强调块：粗色块 + 竖排品牌名
     margin = width * 0.085
@@ -415,10 +496,10 @@ def _layout_band(
     )
 
     title_size, title_lines = _fit_size(
-        title or _TITLE_DEFAULT, max_width=width * 0.72, start=112 * scale, min_size=42 * scale
+        title or _TITLE_DEFAULT, max_width=width * 0.72, start=t["title"] * 0.94, min_size=t["title_min"]
     )
     sub_size, sub_lines = _fit_size(
-        subtitle or _SUBTITLE_DEFAULT, max_width=width * 0.72, start=38 * scale, min_size=24 * scale, max_lines=2
+        subtitle or _SUBTITLE_DEFAULT, max_width=width * 0.72, start=t["subtitle"], min_size=t["subtitle"] * 0.82, max_lines=2
     )
 
     title_lh = title_size * 1.2
@@ -445,7 +526,7 @@ def _layout_band(
     # 品牌字：右上角小字，与左侧竖排块形成对角呼应
     parts.append(
         f'<text x="{width - margin:.1f}" y="{height * 0.115:.1f}" '
-        f'{_title_font(anchor="end", size=25 * scale, font=font, fill=_TEXT_DIM, scale=scale, bold=False, letter_spacing=5 * scale)}>{_esc(brand.upper())}</text>'
+        f'{_title_font(anchor="end", size=t["eyebrow"], font=font, fill=_TEXT, scale=scale, bold=True, letter_spacing=t["eyebrow"] * 0.22)}>{_esc(brand.upper())}</text>'
     )
     parts.append(
         f'<rect x="{width - margin - 70 * scale:.1f}" y="{height * 0.14:.1f}" '
@@ -552,9 +633,10 @@ def _render_pillow_fallback(
 
     scale = min(width / _BASE_W, height / _BASE_H)
     safe = width * _SAFE_RATIO
-    title_size, title_lines = _fit_size(title or _TITLE_DEFAULT, max_width=safe, start=118 * scale, min_size=44 * scale)
+    t = _type_scale(height)
+    title_size, title_lines = _fit_size(title or _TITLE_DEFAULT, max_width=safe, start=t["title"], min_size=t["title_min"])
     sub_size, sub_lines = _fit_size(
-        subtitle or _SUBTITLE_DEFAULT, max_width=safe, start=40 * scale, min_size=24 * scale, max_lines=3
+        subtitle or _SUBTITLE_DEFAULT, max_width=safe, start=t["subtitle"], min_size=t["subtitle"] * 0.82, max_lines=3
     )
     title_font = load_font(int(title_size))
     sub_font = load_font(int(sub_size))
