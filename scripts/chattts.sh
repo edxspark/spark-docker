@@ -76,7 +76,7 @@ install_all() {
   echo "==> 安装依赖（torch / ChatTTS / flask，约 1GB，视网速需要几分钟）"
   "$VENV_DIR/bin/python" -m pip install -i "$PIP_INDEX" torch torchaudio ChatTTS flask requests
   verify_env
-  echo "==> 下载模型权重到 $MODEL_DIR（约 2.2GB）"
+  echo "==> 下载模型权重到 ${MODEL_DIR}（约 2.2GB）"
   "$VENV_DIR/bin/python" - <<PY
 from huggingface_hub import snapshot_download
 path = snapshot_download("2Noise/ChatTTS",
@@ -177,19 +177,199 @@ if __name__ == "__main__":
 PY
 }
 
-main() {
-  if [ "${1:-}" = "--install" ]; then
-    install_all
-    write_server
-    echo "✓ 安装完成：$CHATTTS_DIR"
-  fi
+PID_FILE="$CHATTTS_DIR/chattts.pid"
+LOG_FILE="$CHATTTS_DIR/chattts.log"
+AGENT_LABEL="com.spark.chattts"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
 
+health_url() { echo "http://127.0.0.1:$PORT/"; }
+
+port_owner_pid() {
+  command -v lsof >/dev/null 2>&1 || return 1
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1
+}
+
+running_pid() {
+  # 优先信 pidfile，其次看端口占用者
+  if [ -f "$PID_FILE" ]; then
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "$pid"
+      return 0
+    fi
+  fi
+  port_owner_pid
+}
+
+require_env() {
   if [ ! -x "$VENV_DIR/bin/python" ]; then
     echo "✗ 未安装 ChatTTS 运行环境。先执行：./scripts/chattts.sh --install"
     exit 1
   fi
   [ -f "$CHATTTS_DIR/server.py" ] || write_server
+}
 
+wait_ready() {
+  # 模型加载是同步的：Flask 开始监听时模型已经就绪，所以端口通了就算就绪。
+  # 首次加载约 10~60 秒，这里给足时间。
+  local deadline=$((SECONDS + ${1:-240}))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if curl -fsS -m 2 "$(health_url)" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+cmd_status() {
+  local pid
+  if pid="$(running_pid)"; then
+    local probe="不可达"
+    curl -fsS -m 3 "$(health_url)" >/dev/null 2>&1 && probe="正常"
+    echo "● 运行中  PID $pid  端口 $PORT  探活：$probe"
+    echo "  日志：$LOG_FILE"
+    return 0
+  fi
+  echo "○ 未运行（端口 $PORT 无监听）"
+  echo "  启动：./scripts/chattts.sh --daemon"
+  return 1
+}
+
+cmd_stop() {
+  local pid
+  if ! pid="$(running_pid)"; then
+    echo "○ 未运行，无需停止"
+    rm -f "$PID_FILE"
+    return 0
+  fi
+  echo "==> 停止 ChatTTS（PID ${pid}）"
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 25); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "    优雅退出超时，强制结束"
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+  echo "✓ 已停止"
+}
+
+cmd_daemon() {
+  require_env
+  local pid
+  if pid="$(running_pid)"; then
+    echo "○ 已在运行（PID ${pid}）"
+    cmd_status
+    return 0
+  fi
+  mkdir -p "$CHATTTS_DIR"
+  # nohup 让进程忽略 SIGHUP：这样关掉终端窗口不会把它一起带走。
+  # 事故背景：原来只能前台跑，终端一关 / Ctrl+C / IDE 停止运行就没了，
+  # 而流水线一路跑到「语音合成」阶段才会发现服务不在了——
+  # 实测白做了 2 分 38 秒的下载 + 语音识别 + 翻译。
+  nohup env CHATTTS_MODEL_DIR="$MODEL_DIR" PORT="$PORT" \
+    "$VENV_DIR/bin/python" "$CHATTTS_DIR/server.py" >>"$LOG_FILE" 2>&1 &
+  pid=$!
+  echo "$pid" >"$PID_FILE"
+  echo "==> 已在后台启动（PID ${pid}），等待模型加载…"
+  if wait_ready 240; then
+    echo "✓ ChatTTS 服务就绪：$(health_url)"
+    echo "  日志：${LOG_FILE}（./scripts/chattts.sh --logs 跟踪）"
+    return 0
+  fi
+  echo "✗ 等待就绪超时（240s）。最近日志："
+  tail -12 "$LOG_FILE" 2>/dev/null || true
+  return 1
+}
+
+cmd_logs() {
+  [ -f "$LOG_FILE" ] || { echo "还没有日志：$LOG_FILE"; return 1; }
+  tail -f "$LOG_FILE"
+}
+
+cmd_install_agent() {
+  require_env
+  mkdir -p "$(dirname "$AGENT_PLIST")"
+  cat > "$AGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$AGENT_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$VENV_DIR/bin/python</string>
+    <string>$CHATTTS_DIR/server.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CHATTTS_MODEL_DIR</key><string>$MODEL_DIR</string>
+    <key>PORT</key><string>$PORT</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <!-- KeepAlive：进程无论什么原因退出都会被 launchd 拉起来。
+       这才是「服务突然没了」的根治办法——终端关闭、Ctrl+C、IDE 停止运行都不再影响它。 -->
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$LOG_FILE</string>
+  <key>StandardErrorPath</key><string>$LOG_FILE</string>
+  <key>WorkingDirectory</key><string>$CHATTTS_DIR</string>
+</dict>
+</plist>
+PLIST
+  # 先停掉手动启动的实例，避免端口冲突
+  cmd_stop >/dev/null 2>&1 || true
+  launchctl bootout "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
+  if ! launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" 2>/dev/null; then
+    launchctl load -w "$AGENT_PLIST"
+  fi
+  echo "==> 已注册开机自启（${AGENT_LABEL}），等待就绪…"
+  if wait_ready 240; then
+    echo "✓ ChatTTS 已由 launchd 托管：退出会自动重启，登录后也会自动启动"
+    return 0
+  fi
+  echo "✗ 等待就绪超时，看日志：$LOG_FILE"
+  return 1
+}
+
+cmd_uninstall_agent() {
+  launchctl bootout "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 \
+    || launchctl unload -w "$AGENT_PLIST" >/dev/null 2>&1 || true
+  rm -f "$AGENT_PLIST"
+  echo "✓ 已取消开机自启（当前进程未停止，如需停止：--stop）"
+}
+
+main() {
+  case "${1:-}" in
+    --install)         install_all; write_server; echo "✓ 安装完成：$CHATTTS_DIR"; return 0 ;;
+    --daemon)          cmd_daemon; return $? ;;
+    --status)          cmd_status; return $? ;;
+    --stop)            cmd_stop; return $? ;;
+    --logs)            cmd_logs; return $? ;;
+    --install-agent)   cmd_install_agent; return $? ;;
+    --uninstall-agent) cmd_uninstall_agent; return 0 ;;
+    -h|--help)
+      cat <<'USAGE'
+用法：./scripts/chattts.sh [选项]
+
+  --install           首次安装（建 venv、装依赖、拉模型权重）
+  --daemon            后台启动（关掉终端也不受影响）← 推荐
+  --status            查看运行状态与探活结果
+  --stop              停止服务
+  --logs              跟踪日志
+  --install-agent     注册开机自启 + 退出自动重启（launchd，最稳）
+  --uninstall-agent   取消开机自启
+  不带参数            前台启动（Ctrl+C 停止）
+USAGE
+      return 0 ;;
+    ""|--foreground)   : ;;
+    *) echo "未知参数：$1（用 --help 看用法）"; return 2 ;;
+  esac
+
+  require_env
   if port_in_use "$PORT"; then
     echo "✗ 端口 $PORT 已被占用：可能服务已在运行。"
     echo "  验证：curl -s http://127.0.0.1:$PORT/"
@@ -197,6 +377,7 @@ main() {
   fi
 
   echo "==> 启动 ChatTTS 服务 http://127.0.0.1:$PORT （Ctrl+C 停止）"
+  echo "    提示：前台运行会在你关闭终端时被一起带走，长期使用建议 --daemon"
   echo "    系统配置 → 语音合成 → 服务地址填 http://127.0.0.1:$PORT"
   echo
   CHATTTS_MODEL_DIR="$MODEL_DIR" PORT="$PORT" \

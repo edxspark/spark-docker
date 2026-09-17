@@ -19,7 +19,7 @@ from app.core.events import event_bus
 from app.db import SessionLocal, get_session
 from app.models import Task, TaskItem, TaskLog, TaskStatus
 from app.pipeline.runner import task_runner
-from app.providers import build_downloader, build_publisher
+from app.providers import build_downloader, build_publisher, build_tts
 from app.schemas import (
     PIPELINE_META,
     CreateTaskRequest,
@@ -37,6 +37,8 @@ from app.schemas import (
 from app.services.settings_store import (
     DownloadConfig,
     PublishConfig,
+    TTSConfig,
+    merge_tts_config,
     settings_store,
 )
 from app.utils.text import truncate
@@ -98,6 +100,47 @@ def _describe_selection(probe_total: int, entries: list) -> str:
     return f"已挑选 {len(entries)} 个视频（合集共 {probe_total} 个）"
 
 
+async def _require_tts_ready(config: dict) -> None:
+    """开工前先确认语音合成服务可用，不可用就直接拒绝建任务。
+
+    事故：ChatTTS 服务在任务跑到一半时已经不在了（它原来是前台跑的，终端一关就没了），
+    流水线却照样下载、语音识别、翻译，一路跑到「语音合成」阶段才失败——
+    实测白白做掉 2 分 38 秒，而且整个任务被判失败。
+    本地服务在不在是一件 1 秒钟就能问清楚的事，没有理由等跑完前三步才发现。
+
+    只对 chattts 做探活：它依赖本机进程，最容易被意外带走。
+    阿里云的凭证问题会由提供者自己报错，且探活要发起真实合成调用（要计费），不在这里做。
+    """
+    if str(config.get("tts", {}).get("provider") or "") != "chattts":
+        return
+    try:
+        tts = build_tts(TTSConfig(**merge_tts_config(config)))
+    except Exception:  # noqa: BLE001 - 配置不完整时交给后面的阶段报错
+        return
+    probe = getattr(tts, "probe", None)
+    if probe is None:
+        return
+    try:
+        reachable, note = await asyncio.wait_for(probe(), timeout=8)
+    except Exception as exc:  # noqa: BLE001 - 超时/异常一律视为不可用
+        reachable, note = False, f"{type(exc).__name__}: {exc}"
+    if reachable:
+        return
+
+    endpoint = getattr(tts, "endpoint", "http://127.0.0.1:9966/tts")
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"语音合成服务（ChatTTS）连不上：{endpoint}（{note}）。"
+            "任务没有开始——否则要等下载、语音识别、翻译都跑完才会卡在这一步。\n"
+            "启动服务：./scripts/chattts.sh --daemon"
+            "（后台运行，关掉终端也不受影响）；"
+            "查看状态：./scripts/chattts.sh --status。"
+            "想让它开机自启并在退出后自动重启：./scripts/chattts.sh --install-agent"
+        ),
+    )
+
+
 @router.post("", response_model=TaskDetailOut, status_code=201)
 async def create_task(
     payload: CreateTaskRequest,
@@ -105,6 +148,8 @@ async def create_task(
 ) -> TaskDetailOut:
     """创建搬运任务：解析链接 → 建立条目 → 入队执行。"""
     config = await settings_store.load_all(session)
+    # 本地服务不可用时先拒绝：这一步只要 1 秒，却省下前面几分钟的白工
+    await _require_tts_ready(config)
     downloader = build_downloader(DownloadConfig(**config["download"]))
     try:
         probe = await downloader.probe(payload.url)
