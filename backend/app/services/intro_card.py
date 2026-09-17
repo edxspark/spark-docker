@@ -666,8 +666,16 @@ def _render_pillow_fallback(
     return "pillow"
 
 
+# 版式「设计版本」。
+#
+# 必须参与缓存 key：缓存只按尺寸/文案/字体/版式做键，不含配色与构图。
+# 结果就是——改了设计、重新跑任务，画面却还是旧的那张（命中旧缓存），
+# 用户会以为改动没生效。**每次改动配色或构图都要把这个数字 +1。**
+_DESIGN_VERSION = 2
+
+
 def _cache_key(width: int, height: int, title: str, subtitle: str, font: str, brand: str, layout: str) -> str:
-    raw = f"{width}x{height}|{title}|{subtitle}|{font}|{brand}|{layout}"
+    raw = f"v{_DESIGN_VERSION}|{width}x{height}|{title}|{subtitle}|{font}|{brand}|{layout}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
