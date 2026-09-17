@@ -81,6 +81,34 @@ class _Progress:
     cancel_check: Any = None
 
 
+def resolve_cookies_file(config: DownloadConfig) -> Path | None:
+    """决定本次下载用哪个 cookies 文件。
+
+    优先用户显式配置的路径；没有配置时回退到「应用自己导出」的那份
+    （由「登录 YouTube 并导出 cookies」生成）。这样用户登录一次之后不必再手动填
+    路径，也不会因为忘了填而继续撞风控。
+
+    显式配置但路径无效时必须直接报错：静默忽略只会让用户面对一个看起来毫无头绪的
+    「需要登录」错误，而根因其实是他把路径写错了。
+    """
+    if config.cookies_file:
+        path = Path(config.cookies_file).expanduser()
+        if not path.exists():
+            raise ProviderError(
+                f"配置的 cookies 文件不存在：{path}。"
+                "请在「系统配置 → 下载 → Cookies 文件」里改成正确的绝对路径，"
+                "或清空该字段，改用应用内置的「登录 YouTube 并导出 cookies」"
+            )
+        if path.stat().st_size == 0:
+            raise ProviderError(f"配置的 cookies 文件是空的：{path}")
+        return path
+
+    default = settings.data_dir / "auth" / "youtube_cookies.txt"
+    if default.exists() and default.stat().st_size > 0:
+        return default
+    return None
+
+
 def _base_opts(config: DownloadConfig) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
@@ -100,8 +128,9 @@ def _base_opts(config: DownloadConfig) -> dict[str, Any]:
     }
     if config.proxy:
         opts["proxy"] = config.proxy
-    if config.cookies_file:
-        opts["cookiefile"] = config.cookies_file
+    cookies = resolve_cookies_file(config)
+    if cookies:
+        opts["cookiefile"] = str(cookies)
     if config.sleep_interval > 0:
         opts["sleep_interval"] = config.sleep_interval
     if config.rate_limit:
@@ -158,7 +187,12 @@ def _friendly_error(exc: Exception, url: str = "", action: str = "解析链接")
         return f"{action}失败：{_NETWORK_HINT}（原始错误：{text[:300]}）"
     if "sign in" in lowered or "confirm your age" in lowered or "private video" in lowered:
         return (
-            f"{action}失败：该视频需要登录，请在「系统配置 → 下载」中配置 cookies 文件。"
+            f"{action}失败：该视频需要登录（YouTube 对匿名请求做了「确认你不是机器人」风控）。"
+            "两种解法，任选其一："
+            "① 点「系统配置 → 下载 → 登录 YouTube 并导出 cookies」，"
+            "在弹出的浏览器里登录一次即可（推荐，不需要装插件或改系统权限）；"
+            "或运行 ./scripts/youtube_login.sh。"
+            "② 自己导出 cookies.txt，把绝对路径填到「系统配置 → 下载 → Cookies 文件」。"
             f"（原始错误：{text[:300]}）"
         )
     if "unsupported url" in lowered or "is not a valid url" in lowered:

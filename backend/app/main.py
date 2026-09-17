@@ -18,6 +18,7 @@ from app.api import douyin as douyin_api
 from app.api import settings as settings_api
 from app.api import stats as stats_api
 from app.api import tasks as tasks_api
+from app.api import youtube as youtube_api
 from app.core.config import settings
 from app.db import dispose_db, init_db
 from app.pipeline.runner import recover_interrupted_tasks
@@ -68,6 +69,7 @@ app.add_middleware(
 app.include_router(settings_api.router)
 app.include_router(tasks_api.router)
 app.include_router(douyin_api.router)
+app.include_router(youtube_api.router)
 app.include_router(stats_api.router)
 
 
