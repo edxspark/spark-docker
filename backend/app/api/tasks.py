@@ -586,8 +586,14 @@ async def publish_item(
         await session.refresh(item)
         return TaskItemOut.model_validate(item)
 
+    # Mock 发布必须一眼看得出来，绝不能长得像真发布。
+    # 事故复盘：发布服务被设成「Mock」时，这里照样写「已发布」并落一个
+    # douyin.com/video/mock-xxx 的链接，界面上与真实发布完全一样，
+    # 于是「发布到抖音失效了」的真实原因（压根没上传）被彻底掩盖，排查方向全错。
+    is_mock = getattr(publisher, "name", "") == "mock"
+
     item.publish_status = "published" if result.success else "failed"
-    item.publish_url = result.work_url or item.publish_url
+    item.publish_url = "" if is_mock else (result.work_url or item.publish_url)
     item.publish_error = ""
     item.published_at = datetime.now() if result.success else None
 
@@ -597,8 +603,14 @@ async def publish_item(
         # 连带残留的「失败于「publish」」消息也不清掉——
         # 列表里看到的就是「发布成功但状态仍是失败」。
         item.status = TaskStatus.SUCCEEDED.value
-        item.message = "已发布"
+        item.message = "[模拟] 未实际上传抖音（发布服务为 Mock）" if is_mock else "已发布"
         item.error = ""
+        if is_mock:
+            logger.warning(
+                "条目 %s 走的是 Mock 发布：没有上传到抖音。"
+                "如需真实发布，请到「系统配置 → 发布 → 发布服务」选「抖音（真实发布）」",
+                item.id,
+            )
 
     _record_publish_attempt(
         item,

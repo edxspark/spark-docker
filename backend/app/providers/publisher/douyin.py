@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -83,9 +84,17 @@ UPLOAD_DONE_SELECTORS = (
     'text=重新上传',
 )
 UPLOAD_FAILED_SELECTORS = (
+    # 注意 class 是 upload-progress-xxxx 这种带哈希后缀的形式，
+    # 写死 progress-div 匹配不到（留着只为兼容旧版页面），真正兜底的是下面那条文案匹配
     'div.progress-div > div:has-text("上传失败")',
+    '[class*="upload-progress"] :has-text("上传失败")',
     'text=上传失败',
 )
+
+# 抖音在页面上会自报上传进度：「已上传： 25.2MB/86.9MB 当前速度：350.8KB/s 剩余时间：3分1秒」
+# 用它判断「是否还在推进」，比固定墙钟超时可靠得多。
+_UPLOAD_BYTES_RE = re.compile(r"已上传：\s*([\d.]+)\s*(B|KB|MB|GB)?")
+_UNIT_BYTES = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}
 
 # 封面弹窗内的上传输入框。
 # 弹窗里有两个 input.semi-upload-hidden-input（各自还带一个 -replace 兄弟）：
@@ -793,11 +802,34 @@ class DouyinPublisher(BasePublisher):
             await page.wait_for_timeout(150)
         await page.keyboard.press("Escape")
 
-    async def _wait_upload_finished(self, page, video_path: Path, timeout_ms: int) -> None:
+    async def _wait_upload_finished(
+        self, page, video_path: Path, timeout_ms: int, *, stall_limit: float | None = None
+    ) -> None:
+        """等上传完成。
+
+        这里不能用「固定墙钟超时」判失败。实测同一条链路、同一个 86.9MB 成片，
+        上传速度在 17.9KB/s ~ 1.4MB/s 之间剧烈波动：快的时候 75 秒传完，
+        慢的时候页面自报「剩余时间 1小时22分」。固定 600 秒会把「慢但一直在推进」
+        的上传误杀成「超时」，而这恰恰是线上真实发生过的报错。
+
+        因此超时语义改成「**多久没有新进展**」：
+          - 只要已上传字节数还在涨，就按 timeout 续期（总时长有硬上限兜底）；
+          - 连续 timeout 一点没动，才判定卡死并报错，错误里带上当时的速度与剩余时间。
+        """
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout_ms / 1000
+        base = timeout_ms / 1000
+        # 只用两个判据结束等待，不用「固定墙钟」：
+        #   1. 停滞：连续 stall_limit 秒字节数没变 → 判定卡死；
+        #   2. 硬上限：再慢也不能无限等（4 倍配置值，且至少再给 20 分钟）。
+        hard_deadline = loop.time() + max(base * 4, base + 1200)
+        if stall_limit is None:
+            stall_limit = max(120.0, base / 4)
         reported = 0.0
-        while loop.time() < deadline:
+        retried = False
+        last_bytes: float | None = None
+        last_change = start = loop.time()
+
+        while loop.time() < hard_deadline:
             if await _exists(page, UPLOAD_DONE_SELECTORS):
                 logger.info("视频上传完成：%s", video_path.name)
                 return
@@ -810,12 +842,108 @@ class DouyinPublisher(BasePublisher):
                 if upload_input is None:
                     raise ProviderError("视频上传失败，且未找到重试入口")
                 await upload_input.set_input_files(str(video_path))
+                last_bytes = None
+                last_change = loop.time()
                 await asyncio.sleep(3)
+            elif not retried and await self._upload_was_reset(page):
+                # 上传区回到了空态（已退回上传页、没有进度、也没有「取消上传」）：
+                # 说明这次上传被打断了，而界面上不会报「上传失败」，
+                # 只会一直等到超时。重选一次文件比干等有意义得多。
+                logger.warning("上传进度消失且上传区回到空态，判定上传被中断，自动重新上传一次")
+                upload_input = await _first_visible(
+                    page, UPLOAD_INPUT_SELECTORS, timeout=10000, state="attached"
+                )
+                if upload_input is not None:
+                    retried = True
+                    await upload_input.set_input_files(str(video_path))
+                    last_bytes = None
+                    last_change = loop.time()
+                    await asyncio.sleep(3)
+
+            progressed = await self._upload_progress_bytes(page)
+            if progressed is not None and (last_bytes is None or progressed > last_bytes + 0.05):
+                # 字节数还在涨 → 记为有进展，慢速上传不会被误杀
+                last_bytes = progressed
+                last_change = loop.time()
+
+            if loop.time() - last_change > stall_limit:
+                raise ProviderError(
+                    f"视频上传停滞 {stall_limit:.0f} 秒没有任何进展，已放弃。"
+                    f"当前页面：{page.url}；上传状态：{await self._upload_progress(page)}。"
+                    "若速度极低（几十 KB/s）说明本机到抖音的上传带宽不足，"
+                    "可降低成片码率/分辨率，或换网络更好的环境重试"
+                )
             if loop.time() - reported > 15:
                 reported = loop.time()
-                logger.info("仍在等待抖音上传完成…")
+                logger.info("仍在等待抖音上传完成…（%s）", await self._upload_progress(page))
             await asyncio.sleep(2)
-        raise ProviderError(f"等待视频上传完成超时（{self.config.timeout}s）")
+        # 超时信息必须能自证原因。
+        # 事故复盘：这里原先只抛一句「等待视频上传完成超时（600s）」，页面上明明写着
+        # 「已上传 78.6MB/86.9MB」或「当前速度 1.2MB/s」这类决定性信息却拿不到，
+        # 只能靠猜是平台改版还是网络慢——排查代价极大。
+        raise ProviderError(
+            f"等待视频上传完成超过总时长上限（{hard_deadline - start:.0f}s，"
+            f"由超时配置 {self.config.timeout}s 推导）。"
+            f"当前页面：{page.url}；上传状态：{await self._upload_progress(page)}。"
+            "上传一直在推进但太慢，建议降低成片码率/分辨率，或换网络更好的环境重试"
+        )
+
+    async def _upload_progress_bytes(self, page) -> float | None:
+        """解析页面上「已上传： 25.2MB」的字节数；解析不到返回 None。
+
+        返回 None 与「没有进展」必须区别对待：页面在「文件解析中，请稍等…」阶段
+        本来就没有字节数，不能据此判定卡死。
+        """
+        text = await self._upload_progress(page)
+        match = _UPLOAD_BYTES_RE.search(text)
+        if not match:
+            return None
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            return None
+        return value * _UNIT_BYTES.get((match.group(2) or "B").upper(), 1)
+
+    async def _upload_progress(self, page) -> str:
+        """读取页面上抖音自己的上传进度文案（已上传/速度/剩余时间）。"""
+        try:
+            text = await page.evaluate(
+                """() => {
+                    const detail = document.querySelector('[class*="upload-progress-detail"]');
+                    const pct = document.querySelector('[class*="upload-progress-inner"]');
+                    const parts = [];
+                    if (pct && pct.innerText.trim()) parts.push(pct.innerText.trim());
+                    if (detail && detail.innerText.trim()) {
+                        parts.push(detail.innerText.trim().replace(/\\s+/g, ' '));
+                    }
+                    return parts.join('  |  ');
+                }"""
+            )
+        except Exception:  # noqa: BLE001 - 读不到不是错误，给个可读的占位
+            return "（无法读取上传进度）"
+        return text or "（页面上没有上传进度元素）"
+
+    async def _upload_was_reset(self, page) -> bool:
+        """上传区是否回到了「还没开始上传」的空态。
+
+        判据必须收紧：发布页的封面区域也有「点击上传新的视频封面」文案，
+        只看「点击上传」会误判成上传被打断，于是重启一次上传，
+        反而把本来正常的流程拖成超时——正是要修的那个病。
+        因此要求同时满足三个条件：
+          1. 已经退回上传页（发布页是 content/post/video）；
+          2. 出现上传页专有的空态文案「拖入此区域」；
+          3. 既没有「取消上传」，也没有任何上传进度元素。
+        """
+        if "content/upload" not in (page.url or ""):
+            return False
+        state = await page.evaluate(
+            """() => ({
+                empty: document.body.innerText.includes('拖入此区域'),
+                cancelling: document.body.innerText.includes('取消上传'),
+                progressed: !!document.querySelector('[class*="upload-progress-detail"]'),
+            })"""
+        )
+        return bool(state.get("empty")) and not state.get("cancelling") and not state.get("progressed")
 
     async def _set_cover(self, page, request: PublishRequest) -> bool:
         """设置封面。成功返回 True。
