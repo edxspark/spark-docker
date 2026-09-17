@@ -22,7 +22,7 @@ from app.api import youtube as youtube_api
 from app.core.config import settings
 from app.db import dispose_db, init_db
 from app.pipeline.runner import recover_interrupted_tasks
-from app.services.settings_store import settings_store
+from app.services.settings_store import migrate_split_tts_sections, settings_store
 
 logging.basicConfig(
     level=logging.DEBUG if settings.debug else logging.INFO,
@@ -43,6 +43,8 @@ async def lifespan(app: FastAPI):
     from app.db import SessionLocal
 
     async with SessionLocal() as session:
+        # 老库里的语音合成配置是一张表装两套参数，先拆到各通道分组再载入缓存
+        await migrate_split_tts_sections(session)
         await settings_store.load_all(session)
     logger.info("数据目录：%s", settings.data_dir)
     logger.info("服务已就绪：http://%s:%s", settings.host, settings.port)

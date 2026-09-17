@@ -23,6 +23,9 @@ const selectedIds = ref<string[]>([])
 const probedUrl = ref('')
 
 const voices = ref<Voice[]>([])
+/** 当前语音合成提供者：ChatTTS 的音色由系统配置里的种子决定，任务页不选发音人 */
+const ttsProvider = ref('')
+const usesChatTts = computed(() => ttsProvider.value === 'chattts')
 const defaultsLoaded = ref(false)
 
 const form = reactive({
@@ -148,6 +151,7 @@ async function loadDefaults() {
       settingsApi.voices().catch(() => [] as Voice[]),
     ])
     voices.value = voiceList
+    ttsProvider.value = data.config.tts?.provider || ''
     form.voice = data.config.tts?.voice || voiceList[0]?.id || ''
     form.autoPublish = data.config.publish?.auto_publish ?? false
     form.targetAspect = (data.config.video?.target_aspect as any) || 'original'
@@ -189,7 +193,8 @@ function buildOptions(): TaskOptions {
     subtitle_mode: form.subtitleMode,
     bgm_volume: form.bgmVolume,
   }
-  if (form.voice) options.voice = form.voice
+  // ChatTTS 的说话人来自系统配置（固定种子），不接受任务级发音人
+  if (form.voice && !usesChatTts.value) options.voice = form.voice
   if (form.publishMode === 'scheduled') {
     options.schedule_offset_minutes = form.scheduleOffset
   } else {
@@ -426,12 +431,16 @@ onMounted(() => {
             </el-form-item>
 
             <el-form-item label="配音音色">
-              <el-select v-model="form.voice" filterable placeholder="选择发音人" style="width: 100%">
+              <el-select v-if="!usesChatTts" v-model="form.voice" filterable placeholder="选择发音人" style="width: 100%">
                 <el-option v-for="voice in voices" :key="voice.id" :label="voice.name" :value="voice.id">
                   <span>{{ voice.name }}</span>
                   <span class="muted" style="float: right; font-size: 12px">{{ voice.scene }}</span>
                 </el-option>
               </el-select>
+              <div v-else class="muted inline-help" style="margin-top: 0">
+                当前使用 ChatTTS，音色由「系统配置 → 语音合成 → 音色随机种子」固定，任务级无需选择
+                <el-link type="primary" :underline="false" @click="openSettings('tts')">去调整</el-link>
+              </div>
             </el-form-item>
 
             <el-form-item label="画面比例">

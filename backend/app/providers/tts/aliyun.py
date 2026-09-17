@@ -124,6 +124,8 @@ class AliyunTTS(BaseTTS):
 
     def __init__(self, config: TTSConfig) -> None:
         self.config = config
+        # 按性别选定的发音人（任务级；空表示未启用性别匹配）
+        self.gender_voice = ""
         if not config.app_key:
             raise NotConfiguredError("未配置阿里云项目 AppKey，请在「系统配置 → 语音合成」中填写")
 
@@ -131,8 +133,32 @@ class AliyunTTS(BaseTTS):
     def endpoint(self) -> str:
         return f"https://nls-gateway-{self.config.region}.aliyuncs.com/stream/v1/tts"
 
+    async def prepare_gender(self, gender: str) -> str:
+        """按性别切换发音人：男声用配置/清单里的男声，女声同理。
+
+        ALIYUN_VOICES 里每个发音人都带 gender 标注，因此这里不需要额外探测。
+        """
+        if gender not in {"male", "female"}:
+            return ""
+        configured = (
+            self.config.voice_male if gender == "male" else self.config.voice_female
+        ).strip()
+        chosen = configured
+        if not chosen:
+            for item in ALIYUN_VOICES:
+                if item.get("gender") == gender:
+                    chosen = str(item["id"])
+                    break
+        if not chosen:
+            return f"内置发音人清单里没有{gender}声，沿用当前发音人 {self.config.voice}"
+        self.gender_voice = chosen
+        label = "男声" if gender == "male" else "女声"
+        name = next((v["name"] for v in ALIYUN_VOICES if v["id"] == chosen), chosen)
+        return f"按性别选音色：{label} → 发音人 {name}（{chosen}）"
+
     async def synthesize(self, text: str, out_path: Path, *, voice: str | None = None) -> SynthesisResult:
-        chosen_voice = voice or self.config.voice
+        # 优先级：调用方指定 > 按性别选定 > 配置默认
+        chosen_voice = voice or self.gender_voice or self.config.voice
         text = (text or "").strip()
         if not text:
             raise ProviderError("待合成文本为空")

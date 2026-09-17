@@ -119,6 +119,24 @@ function statsRows(item: TaskItem): { label: string; value: string }[] {
     })
   }
   if (stats.asr_error) rows.push({ label: '识别失败', value: String(stats.asr_error).slice(0, 120) })
+  // 配音性别匹配：把判定依据摆出来，用户发现配错声音时能立刻知道是判定错了还是音色挑错了
+  const gender = stats.tts?.voice_gender as Record<string, any> | undefined
+  if (gender && gender.mode !== 'off') {
+    const profile = (gender.profile || {}) as Record<string, any>
+    const label = (g?: string) => (g === 'male' ? '男声' : g === 'female' ? '女声' : '未判定')
+    const parts: string[] = []
+    if (gender.mode === 'auto') {
+      parts.push(
+        profile.gender && profile.gender !== 'unknown'
+          ? `原视频判定为${label(profile.gender)}（基频 ${profile.f0_hz} Hz，置信 ${profile.confidence}）`
+          : `未能判定（${gender.reason || '音频信息不足'}）→ 按${label(gender.target)}配音`,
+      )
+    } else {
+      parts.push(`手动指定${label(gender.mode)}`)
+    }
+    if (gender.applied) parts.push(String(gender.applied))
+    rows.push({ label: '配音性别', value: parts.join('；') })
+  }
   if (stats.sentences) rows.push({ label: '断句后', value: `${stats.sentences} 句` })
   const translate = stats.translate
   if (translate) {

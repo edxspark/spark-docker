@@ -33,6 +33,8 @@ class PipelineConfig:
     download: dict[str, Any]
     publish: dict[str, Any]
     video: dict[str, Any]
+    # 统一开头语（缺省空字典 = 不插入开头语）
+    intro: dict[str, Any] = field(default_factory=dict)
     options: dict[str, Any] = field(default_factory=dict)
 
     def merged(self, section: str, **overrides: Any) -> dict[str, Any]:

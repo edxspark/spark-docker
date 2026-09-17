@@ -34,7 +34,8 @@ from app.pipeline.stages.localize import (
 )
 from app.providers import build_all
 from app.providers.base import ProviderError
-from app.services.settings_store import settings_store
+from app.services import intro as intro_service
+from app.services.settings_store import merge_tts_config, settings_store
 from app.services.subtitles import normalize_cues, parse_subtitle_file, reindex
 
 logger = logging.getLogger(__name__)
@@ -151,11 +152,13 @@ class TaskRunner:
         pipeline_config = PipelineConfig(
             general=general,
             translator=config["translator"],
-            tts=config["tts"],
+            # 公共项 + 当前通道专属参数（库里分三组存，流水线只认这一份）
+            tts=merge_tts_config(config),
             asr=config.get("asr", {}),
             download=config["download"],
             publish=config["publish"],
             video=config["video"],
+            intro=config.get("intro", {}),
             options=dict(task.options or {}),
         )
         reporter = Reporter(task_id, SessionLocal, handle.cancel_event)
@@ -289,7 +292,14 @@ class TaskRunner:
             if not (paths.subtitle_zh.exists() and state.cues_zh):
                 return False
             # 换了翻译服务/模型后，旧译文（可能是 mock 占位）必须重做
-            return (state.stats.get("translate") or {}).get("config_key") == translate_config_key(ctx)
+            if (state.stats.get("translate") or {}).get("config_key") != translate_config_key(ctx):
+                return False
+            # 统一开头语是在这个阶段插进去的：文案/停顿/开关变了必须再进一次，
+            # 否则改完设置重跑，字幕里还是上一轮的旧开场白（配音指纹变了、
+            # 会重新合成，但字幕不会更新——这种「声画不一致」很难排查）
+            return (state.stats.get("intro") or {}).get("config_key") == intro_service.intro_config_key(
+                ctx.config.merged("intro")
+            )
         if stage_name == "tts":
             needed = len(state.cues_zh)
             if needed == 0:
@@ -380,6 +390,27 @@ class TaskRunner:
                     state.cues_zh = reindex(normalize_cues(parse_subtitle_file(stored)))
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("恢复中文字幕失败：%s", exc)
+
+        # 统一开头语：标记写进 SRT 就会丢失，因此持久化的事实是 stats["intro"]。
+        # 这里只在「恢复出来的字幕看起来带开头语、而 stats 又没有记录」时补一条，
+        # 让下一次运行能识别并撤掉它（配置改了要重做，配置没变则不重复插入）。
+        intro_cfg = ctx.config.merged("intro")
+        intro_settings = intro_service.intro_settings(intro_cfg)
+        intro_stats = state.stats.get("intro") or {}
+        if (
+            not intro_stats.get("offset")
+            and intro_settings["enabled"]
+            and state.cues_zh
+            and state.cues_zh[0].start < 0.35
+        ):
+            state.stats["intro"] = {
+                "mode": "restored",
+                "config_key": "",
+                "text": state.cues_zh[0].text,
+                "gap_seconds": intro_settings["gap_seconds"],
+                "show_in_subtitle": intro_settings["show_in_subtitle"],
+                "offset": round(state.cues_zh[0].end, 3),
+            }
 
         return state
 

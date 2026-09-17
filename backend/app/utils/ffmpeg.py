@@ -508,17 +508,54 @@ async def render_final(
     burn: bool = True,
     crf: int = 20,
     preset: str = "medium",
+    pad_start: float = 0.0,
+    intro_card: Path | None = None,
 ) -> Path:
-    """最终合成：替换音轨 + 可选画面比例转换 + 可选烧录字幕。"""
+    """最终合成：替换音轨 + 可选画面比例转换 + 可选烧录字幕。
+
+    pad_start / intro_card 用于「统一开头语」：
+
+    - 音轨是「开头语 + 停顿 + 正片配音」，比原视频长；成片必须把这部分补成画面，
+      否则开头语会被裁掉。
+    - pad_start：在画面最前面冻结首帧若干秒。
+    - intro_card：这段时间里盖在画面上的标题卡（科技感开头画面）。
+
+    两个坑都在这里踩过并修掉：
+    1. 只写 `-vf` 时，`-shortest` 会以「视频流结束」为准，开头语被整段砍掉
+       （实测：12 秒视频 + 21 秒音轨 → 成片只剩 12 秒）；
+    2. 一旦换成 `-filter_complex`，`-shortest` 的语义会退化成「以最短**输入**为准」
+       （3.5 秒音轨 + 8 秒视频 → 成片 3.5 秒）。因此滤镜图必须显式以
+       `shortest=1` 结尾，让补长后的视频决定成片长度。
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     args: list[str] = ["-i", str(video)]
     if audio is not None:
         args += ["-i", str(audio)]
+    with_card = intro_card is not None and pad_start > 0
+    if with_card:
+        args += ["-i", str(intro_card)]
 
-    filters: list[str] = []
+    # 第一条链：先把标题卡叠在正片开头，再冻结首帧把画面补长到开头语时长。
+    #
+    # 顺序不能反：tpad 是「在时间轴最前面插入」片段，插入帧的时间戳是负数。
+    # 若先 tpad 再 overlay，`enable='lt(t,pad)'` 永远不成立（那些帧的 t<0），
+    # 标题卡会完全不显示——实测就是这样漏掉的。
+    chains: list[str] = []
+    if with_card:
+        cover_w, cover_h = _cover_size(target_aspect, video)
+        chains.append(
+            f"[2:v]scale={cover_w}:{cover_h}:force_original_aspect_ratio=decrease[card];"
+            f"[0:v][card]overlay=(W-w)/2:(H-h)/2:"
+            f"enable='lt(t,{float(pad_start):.3f})':eof_action=pass,"
+            f"tpad=start_duration={float(pad_start):.3f}:start_mode=clone"
+        )
+    elif pad_start > 0:
+        chains.append(f"tpad=start_duration={float(pad_start):.3f}:start_mode=clone")
+
+    # 第二条链：画面比例转换（接受上一条链的输出）
     if target_aspect == "9:16":
         # 竖屏：主画面等比居中，背景用放大模糊铺满，避免黑边
-        filters.append(
+        chains.append(
             "split=2[bg][fg];"
             "[bg]scale=w=1080:h=1920:force_original_aspect_ratio=increase,"
             "crop=1080:1920,boxblur=20:5[bgb];"
@@ -526,21 +563,79 @@ async def render_final(
             "[bgb][fgs]overlay=(W-w)/2:(H-h)/2"
         )
     elif target_aspect == "16:9":
-        filters.append(
+        chains.append(
             "scale=1920:1080:force_original_aspect_ratio=decrease,"
             "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black"
         )
-    if burn and subtitle is not None:
-        filters.append(subtitle_filter(subtitle))
 
-    if filters:
-        args += ["-vf", ",".join(filters)]
+    if burn and subtitle is not None:
+        chains.append(subtitle_filter(subtitle))
+
+    if chains:
+        graph = _join_render_chain(chains)
+        # 滤镜图一旦介入，视频输出就必须显式按标签取出（未标记的输出不会被自动选中）
+        args += ["-filter_complex", graph, "-map", "[vout]"]
     if audio is not None:
-        args += ["-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+        if not chains:
+            args += ["-map", "0:v:0"]
+        args += ["-map", "1:a:0"]
+        if not chains:
+            # 简单 `-vf` 路径沿用 -shortest：让画面与配音等长
+            args += ["-shortest"]
+        # 有滤镜图时不能加 -shortest：它的语义会退化为「以最短输入为准」，
+        # 3.5 秒音轨 + 8 秒视频会产出 3.5 秒成片（实测）。画面已由 tpad 补足，
+        # 音轨末尾的静音由容器自然填充。
     args += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
     args += ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out_path)]
     await run_ffmpeg(args)
     return out_path
+
+
+def _cover_size(target_aspect: str, video: Path) -> tuple[int, int]:
+    """标题卡要贴合的画布尺寸（与最终成片一致）。"""
+    if target_aspect == "9:16":
+        return 1080, 1920
+    if target_aspect == "16:9":
+        return 1920, 1080
+    return _probe_size(video)
+
+
+def _probe_size(video: Path) -> tuple[int, int]:
+    """同步取视频分辨率（构建滤镜链时需要具体像素，不能等异步探测）。"""
+    ffprobe = resolve_binary(settings.ffprobe_bin)
+    if not ffprobe:
+        return 1920, 1080
+    try:
+        output = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(video),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        ).stdout.strip()
+        width, _, height = output.partition("x")
+        return max(2, int(width)), max(2, int(height))
+    except Exception:  # noqa: BLE001 - 探测失败时给安全默认值，渲染仍会按比例适配
+        return 1920, 1080
+
+
+def _join_render_chain(chains: list[str]) -> str:
+    """把滤镜链拼成一张完整滤镜图。
+
+    首条链自己声明输入（例如 `[2:v]...[card];[0:v][card]overlay...`），
+    因此不强加 `[0:v]`；其余链承接上一条的输出标签。
+    """
+    parts: list[str] = []
+    previous: str | None = None
+    for index, chain in enumerate(chains):
+        last = index == len(chains) - 1
+        label = "vout" if last else f"v{index + 1}"
+        prefix = "" if previous is None else f"[{previous}]"
+        parts.append(f"{prefix}{chain}[{label}]")
+        previous = label
+    return ";".join(parts)
 
 
 async def extract_cover(video: Path, out_path: Path, *, at: float = 1.0) -> Path:

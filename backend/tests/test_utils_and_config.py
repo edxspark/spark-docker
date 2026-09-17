@@ -195,3 +195,93 @@ class TestSubtitleFont:
         assert f"FontName={resolve_subtitle_font('')}" in style
         assert "FontSize=22" in style and "MarginV=80" in style
         assert "Alignment=2" in style
+
+
+class TestTtsConfigSplit:
+    """语音合成配置拆成「公共 / ChatTTS / 阿里云」三组后的行为。
+
+    背景：拆组是为了界面上分区展示，但运行时仍需一份平坦配置交给提供者——
+    这里把两端都钉住，防止字段在合并/构造过程中被静默丢掉。
+    """
+
+    def test_merge_picks_current_provider_fields(self):
+        from app.services.settings_store import DEFAULT_CONFIG, merge_tts_config
+
+        base = {**DEFAULT_CONFIG["tts"], "provider": "chattts"}
+        config = {
+            "tts": base,
+            "tts_chattts": {**DEFAULT_CONFIG["tts_chattts"], "voice_seed": 777, "speed": 7},
+            "tts_aliyun": {**DEFAULT_CONFIG["tts_aliyun"], "voice": "aixia", "app_key": "k"},
+        }
+        merged = merge_tts_config(config)
+        assert merged["voice_seed"] == 777 and merged["speed"] == 7
+        # 切到 ChatTTS 时，阿里云那套值不应被带进来（界面与行为都按当前通道走）
+        assert "app_key" not in merged  # 未采用的通道参数不参与合并
+        assert merged["provider"] == "chattts"
+
+        base["provider"] = "aliyun"
+        merged_ali = merge_tts_config(config)
+        assert merged_ali["voice"] == "aixia" and merged_ali["app_key"] == "k"
+        # 反过来：阿里云通道不采用 ChatTTS 的通道参数
+        assert "voice_seed" not in merged_ali
+
+    def test_shared_section_only_keeps_common_fields(self):
+        """公共分组里混进通道字段时必须被剥掉，否则界面又会显示两套参数。"""
+        from app.services.settings_store import SHARED_TTS_FIELDS, legacy_base_section
+
+        dirty = {
+            "provider": "chattts",
+            "concurrency": 2,
+            "voice_seed": 999,
+            "app_key": "leftover",
+            "voice": "ruoxi",
+        }
+        cleaned = legacy_base_section(dirty)
+        # 结果只会是共享字段的子集，通道字段一个都不能留
+        assert set(cleaned) - {"migrated_split", "merged_from"} <= set(SHARED_TTS_FIELDS)
+        assert cleaned["provider"] == "chattts" and cleaned["concurrency"] == 2
+        for leaked in ("voice_seed", "app_key", "voice"):
+            assert leaked not in cleaned
+
+    def test_merged_config_keeps_provider_fields(self):
+        """合并结果必须能被 TTSConfig 完整保留（Pydantic 会丢弃未声明字段）。"""
+        from app.services.settings_store import DEFAULT_CONFIG, TTSConfig, merge_tts_config
+
+        merged = merge_tts_config(
+            {
+                "tts": {**DEFAULT_CONFIG["tts"], "provider": "aliyun"},
+                "tts_chattts": DEFAULT_CONFIG["tts_chattts"],
+                "tts_aliyun": {
+                    **DEFAULT_CONFIG["tts_aliyun"],
+                    "app_key": "app-key-123",
+                    "access_key_id": "ak",
+                    "voice": "ruoxi",
+                },
+            }
+        )
+        parsed = TTSConfig(**merged)
+        assert parsed.provider == "aliyun"
+        assert parsed.app_key == "app-key-123"
+        assert parsed.access_key_id == "ak"
+        assert parsed.voice == "ruoxi"
+        # ChatTTS 字段同样保留（切通道时不需要重新填）
+        assert parsed.chattts_base_url == DEFAULT_CONFIG["tts_chattts"]["chattts_base_url"]
+
+    def test_section_registry_exposes_split_groups(self):
+        from app.services.settings_store import (
+            CONFIG_MODELS,
+            SECRET_FIELDS,
+            SECTION_LABELS,
+            TTS_PROVIDER_SECTIONS,
+        )
+
+        assert TTS_PROVIDER_SECTIONS == {
+            "chattts": "tts_chattts",
+            "aliyun": "tts_aliyun",
+            "mock": "tts_aliyun",  # Mock 复用阿里云分组的通用参数
+        }
+        for section in ("tts", "tts_chattts", "tts_aliyun"):
+            assert section in CONFIG_MODELS and section in SECTION_LABELS
+        # 凭证只在阿里云分组里加密存储
+        assert SECRET_FIELDS["tts_aliyun"] == ("access_key_id", "access_key_secret", "app_key", "token")
+        assert "tts" not in SECRET_FIELDS

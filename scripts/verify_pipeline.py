@@ -160,7 +160,9 @@ async def run(out_dir: Path, aspect: str, no_subtitle: bool, asr_provider: str) 
             session,
             {
                 "translator": {"provider": "mock"},
-                "tts": {"provider": "mock", "voice": "xiaoxian", "sample_rate": 24000, "concurrency": 3},
+                "tts": {"provider": "mock", "concurrency": 3},
+                # 语音合成参数按通道分组存放（此处模拟阿里云/Mock 通道）
+                "tts_aliyun": {"voice": "xiaoxian", "sample_rate": 24000},
                 "publish": {"provider": "mock", "auto_publish": True, "default_tags": ["演示", "搬运"]},
                 "asr": {"provider": asr_provider, "enabled": True, "max_chunk_seconds": 10},
                 "video": {

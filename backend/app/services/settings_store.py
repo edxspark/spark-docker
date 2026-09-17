@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -16,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import decrypt, encrypt, mask
 from app.models import Setting
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------------------
 # 配置模型
@@ -47,9 +50,98 @@ class TranslatorConfig(BaseModel):
 
 
 class TTSConfig(BaseModel):
-    """阿里云智能语音交互（ISI）语音合成。"""
+    """语音合成的「运行时完整配置」：公共项 + 各通道参数。
 
-    provider: Literal["aliyun", "mock"] = "mock"
+    - 配置在库里分成三组，便于用户分别填写、界面上分区展示：
+        tts          —— 公共：通道选择、并发、单请求上限
+        tts_chattts  —— ChatTTS 本地服务参数（ChatTTSConfig）
+        tts_aliyun   —— 阿里云 ISI 参数（AliyunTTSConfig）
+    - 提供者需要一个平坦对象（AliyunTTS 会读 config.app_key 这类通道字段），
+      所以本模型同时声明三组字段：运行时由 SettingsStore.merged_tts() 填入
+      当前通道的值，其余保持默认。
+
+    注意：不要把通道字段移出本模型——Pydantic 默认会**静默丢弃**未声明的字段，
+    合并后的 app_key 等参数会在传给提供者时凭空消失
+    （症状是 AliyunTTS 初始化报 'no attribute app_key'）。
+    """
+
+    provider: Literal["chattts", "aliyun", "mock"] = "chattts"
+    # 配音性别：auto = 先判断原视频说话人性别，再用同性别音色（男配男声、女配女声）；
+    # 也可强制 male / female，或 off 关闭（沿用各通道原来的音色配置）
+    voice_gender: Literal["auto", "off", "male", "female"] = "auto"
+    # 判定为 unknown 时的回退：female / male 指定一个，off 表示不换音色
+    gender_fallback: Literal["female", "male", "off"] = "female"
+    # 单条字幕超过该长度时先在标点处切分再合成（阿里云服务端上限 300 字符）
+    max_chars_per_request: int = Field(default=280, ge=50, le=300)
+    concurrency: int = Field(default=4, ge=1, le=16)
+
+    # ---- ChatTTS 通道字段 ----
+    chattts_base_url: str = "http://127.0.0.1:9966"
+    chattts_api_path: str = "/tts"
+    chattts_prompt: str = ""
+    temperature: float = Field(default=0.3, ge=0.01, le=2.0)
+    top_p: float = Field(default=0.7, ge=0.01, le=1.0)
+    top_k: int = Field(default=20, ge=1, le=200)
+    speed: int = Field(default=5, ge=1, le=9)
+    voice_seed: int = Field(default=2222, ge=0)
+    timeout: float = Field(default=300.0, ge=10.0, le=1800.0)
+    gender_pool_size: int = Field(default=10, ge=2, le=60)
+
+    # ---- 阿里云通道字段 ----
+    access_key_id: str = ""
+    access_key_secret: str = ""
+    app_key: str = ""
+    token: str = ""
+    region: str = "cn-shanghai"
+    voice: str = "xiaoxian"
+    voice_male: str = "xiaogang"
+    voice_female: str = "xiaoxian"
+    # 按性别配音时使用的发音人（留空则从内置清单里自动挑一个）
+    voice_male: str = "xiaogang"
+    voice_female: str = "xiaoxian"
+    format: Literal["mp3", "wav", "pcm"] = "mp3"
+    sample_rate: int = 48000
+    volume: int = Field(default=50, ge=0, le=100)
+    speech_rate: int = Field(default=0, ge=-500, le=500)
+    pitch_rate: int = Field(default=0, ge=-500, le=500)
+    gain_db: float = Field(default=0.0, ge=-20.0, le=20.0)
+
+    @classmethod
+    def all_field_names(cls) -> set[str]:
+        """三个分组模型字段的并集，用于合并时筛掉展示用的元键。"""
+        names: set[str] = set()
+        for model in (cls, ChatTTSConfig, AliyunTTSConfig):
+            names |= set(model.model_fields)
+        return names
+
+
+class ChatTTSConfig(BaseModel):
+    """ChatTTS（本地/内网 HTTP 服务）参数。"""
+
+    # 服务地址；官方 webui 默认 9966 端口
+    chattts_base_url: str = "http://127.0.0.1:9966"
+    # 合成接口路径：官方 app.py 是 /tts，社区封装（ChatTTS-ui）是 /api/say
+    # （/tts 返回 404 时会自动回退到 /api/say）
+    chattts_api_path: str = "/tts"
+    # 风格提示词，如 [oral_2][laugh_0]；留空则只下发 [speed_N]
+    chattts_prompt: str = ""
+    # 采样参数：temperature 偏高更自然但可能不稳
+    temperature: float = Field(default=0.3, ge=0.01, le=2.0)
+    top_p: float = Field(default=0.7, ge=0.01, le=1.0)
+    top_k: int = Field(default=20, ge=1, le=200)
+    # 语速档位 1~9（ChatTTS 内部拼成 [speed_N] 提示词，5 为默认）
+    speed: int = Field(default=5, ge=1, le=9)
+    # 说话人种子：上游即 torch.manual_seed(voice)，固定后全片同一个音色
+    voice_seed: int = Field(default=2222, ge=0)
+    # 单请求超时（秒）：本地模型首次合成要加载权重，给足时间
+    timeout: float = Field(default=300.0, ge=10.0, le=1800.0)
+    # 按性别配音时探测多少个音色（越多越可能同时得到男声与女声）
+    gender_pool_size: int = Field(default=10, ge=2, le=60)
+
+
+class AliyunTTSConfig(BaseModel):
+    """阿里云智能语音交互（ISI）参数。"""
+
     access_key_id: str = ""
     access_key_secret: str = ""
     # 项目 AppKey（阿里云控制台「创建项目」后获得）
@@ -58,6 +150,9 @@ class TTSConfig(BaseModel):
     token: str = ""
     region: str = "cn-shanghai"
     voice: str = "xiaoxian"
+    # 按性别配音时使用的发音人；留空则按内置清单（带性别标注）自动挑
+    voice_male: str = "xiaogang"
+    voice_female: str = "xiaoxian"
     format: Literal["mp3", "wav", "pcm"] = "mp3"
     sample_rate: int = 48000
     volume: int = Field(default=50, ge=0, le=100)
@@ -66,9 +161,6 @@ class TTSConfig(BaseModel):
     pitch_rate: int = Field(default=0, ge=-500, le=500)
     # 合成后增益（dB），用于与背景音平衡
     gain_db: float = Field(default=0.0, ge=-20.0, le=20.0)
-    # 单条字幕超过该长度时先在标点处切分（阿里云单请求上限 300 字符）
-    max_chars_per_request: int = Field(default=280, ge=50, le=300)
-    concurrency: int = Field(default=4, ge=1, le=16)
 
 
 class DownloadConfig(BaseModel):
@@ -193,6 +285,41 @@ class GeneralConfig(BaseModel):
     auto_clean_failed: bool = False
 
 
+class IntroConfig(BaseModel):
+    """统一开头语：每支成片开头播报一句固定文案（配音 + 中文字幕）。
+
+    为什么单独成组：它同时影响「语音合成」与「字幕」两条链路——
+    开头语会先合成一段配音，再把原字幕整体后移，
+    因此配置指纹必须参与 TTS 与字幕的重算判断（见 pipeline/stages/localize.py）。
+    """
+
+    enabled: bool = True
+    # 开头语文案（建议不超过 60 字，过长会明显拉长成片开头）
+    text: str = "欢迎来到EdxSpark，我们将为您提供高质量的AI创业、工作、创新、学习等资讯！"
+    # 开头语播完与正片之间的停顿（秒）
+    gap_seconds: float = Field(default=0.6, ge=0.0, le=10.0)
+    # 是否把开头语也写进中文字幕（关闭则只有声音，不烧字幕）
+    show_in_subtitle: bool = True
+    # 播报开头语时显示的科技感标题卡：auto 自动生成 / none 不显示 / custom 用自定义图片
+    card_mode: Literal["auto", "none", "custom"] = "auto"
+    # 自定义图片路径（card_mode = custom 时生效；留空或文件不存在时回退为自动生成）
+    card_image: str = ""
+    # 标题卡版式：hero 左对齐片头 / frame 居中画框 / band 竖排强调块
+    card_layout: Literal["hero", "frame", "band"] = "hero"
+    # 标题卡文案（与开头语配音同一句，便于一眼对上）
+    card_title: str = "欢迎来到 EdxSpark"
+    card_subtitle: str = "AI 创业 · 工作 · 创新 · 学习"
+    # 标题卡底部小字品牌名（会转成大写显示）
+    card_brand: str = "EdxSpark"
+    # 标题卡字体；留空则自动挑系统中可用的中文字体
+    card_font: str = ""
+
+    @field_validator("text", "card_title", "card_subtitle", "card_brand")
+    @classmethod
+    def _clean_text(cls, v: Any) -> Any:
+        return " ".join(str(v or "").split()).strip()
+
+
 class ASRConfig(BaseModel):
     """语音识别（无字幕视频的兜底）。凭证与「语音合成」共用同一个阿里云项目。"""
 
@@ -228,32 +355,94 @@ CONFIG_MODELS: dict[str, type[BaseModel]] = {
     "general": GeneralConfig,
     "translator": TranslatorConfig,
     "tts": TTSConfig,
+    # 语音合成的两套通道参数各自独立成组，避免混在一张表单里分不清
+    "tts_chattts": ChatTTSConfig,
+    "tts_aliyun": AliyunTTSConfig,
     "asr": ASRConfig,
     "download": DownloadConfig,
     "publish": PublishConfig,
     "video": VideoConfig,
+    "intro": IntroConfig,
 }
+
+# 公共分组只允许这些字段：界面上的「语音合成」页签只展示它们，
+# 通道字段一律归各自分组（否则旧库里的通道键会被规范化带回来，拆分就白做了）
+SHARED_TTS_FIELDS: tuple[str, ...] = (
+    "provider",
+    "voice_gender",
+    "gender_fallback",
+    "max_chars_per_request",
+    "concurrency",
+)
+
+# 各通道对应的配置分组名
+TTS_PROVIDER_SECTIONS: dict[str, str] = {
+    "chattts": "tts_chattts",
+    "aliyun": "tts_aliyun",
+    # Mock 复用阿里云分组的通用参数（采样率等）——MockTTS 与 AliyunTTS 同模块
+    "mock": "tts_aliyun",
+}
+# 合并时跳过的非参数键（前端展示用）
+_META_KEYS = {"merged_from", "migrated_split"}
 
 # 需要加密存储的字段
 SECRET_FIELDS: dict[str, tuple[str, ...]] = {
     "translator": ("api_key",),
-    "tts": ("access_key_id", "access_key_secret", "app_key", "token"),
+    "tts_aliyun": ("access_key_id", "access_key_secret", "app_key", "token"),
 }
 
 SECTION_LABELS = {
     "general": "通用",
     "translator": "翻译（DeepSeek）",
-    "tts": "语音合成（阿里云 ISI）",
+    "tts": "语音合成",
+    "tts_chattts": "语音合成 · ChatTTS",
+    "tts_aliyun": "语音合成 · 阿里云",
     "asr": "语音识别（无字幕兜底）",
     "download": "下载（yt-dlp）",
     "publish": "发布（抖音）",
     "video": "成片合成",
+    "intro": "统一开头语",
 }
 
 # 前端「恢复默认」用的全量默认值
 DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
     name: model().model_dump() for name, model in CONFIG_MODELS.items()
 }
+
+
+def _validate_merged_tts(merged: dict[str, Any]) -> None:
+    """按字段归属的模型逐个校验合并结果（TTSConfig 现在含全部通道字段）。"""
+    subset = {k: v for k, v in merged.items() if k in TTSConfig.model_fields}
+    if subset:
+        TTSConfig(**subset)
+
+
+def legacy_base_section(raw: dict[str, Any]) -> dict[str, Any]:
+    """公共分组该保留的内容：共享字段 + 迁移标记（丢掉通道字段）。"""
+    kept = {k: v for k, v in raw.items() if k in SHARED_TTS_FIELDS}
+    kept["migrated_split"] = True
+    kept["merged_from"] = "拆分前的旧记录（通道参数已移到 tts_chattts / tts_aliyun）"
+    return kept
+
+
+def merge_tts_config(config: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """把「公共 tts + 当前通道专属参数」合并成一份完整配置。
+
+    供任务执行器与提供者工厂复用（两者都持有 load_all 的结果）。
+    """
+    base = {
+        k: v
+        for k, v in (config.get("tts") or {}).items()
+        if k not in _META_KEYS and k in SHARED_TTS_FIELDS
+    }
+    section = TTS_PROVIDER_SECTIONS.get(str(base.get("provider") or ""))
+    merged = dict(base)
+    if section:
+        merged.update(
+            {k: v for k, v in (config.get(section) or {}).items() if k not in _META_KEYS}
+        )
+    allowed = TTSConfig.all_field_names()
+    return {k: v for k, v in merged.items() if k in allowed}
 
 
 def _mask_section(section: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -268,6 +457,49 @@ def _mask_section(section: str, data: dict[str, Any]) -> dict[str, Any]:
 def _normalize(section: str, data: dict[str, Any]) -> dict[str, Any]:
     model = CONFIG_MODELS[section]
     return model.model_validate({**DEFAULT_CONFIG[section], **(data or {})}).model_dump()
+
+
+async def migrate_split_tts_sections(session: AsyncSession) -> bool:
+    """把旧库里「一张表装两套参数」的 tts 记录拆到各通道分组。
+
+    旧结构：tts 一行里同时含 ChatTTS 与阿里云字段（含加密密钥），前端一张表单全渲染出来，
+    分不清哪个参数属于哪个通道。新结构把参数分到 tts_chattts / tts_aliyun，
+    这里做一次性搬移，保证用户已填的 AK/SK、音色种子等不会丢。
+
+    幂等：老记录打 migrated_split 标记后不再搬；新装直接跳过。
+    返回是否真的搬过数据（调用方可据此决定是否清缓存）。
+    """
+    row = await session.get(Setting, "tts")
+    raw = dict(row.value) if row and isinstance(row.value, dict) else None
+    if not raw or raw.get("migrated_split"):
+        return False
+
+    moved: list[str] = []
+    for target in TTS_PROVIDER_SECTIONS.values():
+        model = CONFIG_MODELS[target]
+        target_row = await session.get(Setting, target)
+        existing = dict(target_row.value) if target_row and isinstance(target_row.value, dict) else {}
+        values = {k: v for k, v in raw.items() if k in model.model_fields and k not in _META_KEYS}
+        merged = {**values, **existing}  # 已有值优先，迁移只补空缺
+        if target_row is None:
+            session.add(Setting(key=target, value=merged))
+        else:
+            target_row.value = merged
+        moved.extend(sorted(k for k in values if k not in existing))
+
+    # 公共项：只留 provider / 上限 / 并发，通道字段从这一行删除。
+    # 若保留（哪怕只是残留），_normalize 会按模型把通道默认值补回来，
+    # 前端「语音合成」页签又会显示两套参数——等于没拆。
+    base_row = await session.get(Setting, "tts")
+    keeping = legacy_base_section(raw)
+    if base_row is None:
+        session.add(Setting(key="tts", value=keeping))
+    else:
+        base_row.value = keeping
+    await session.commit()
+    settings_store._cache.clear()
+    logger.info("已把语音合成配置拆分为 公共/chattts/aliyun 三组，迁移字段：%s", "、".join(moved) or "无")
+    return True
 
 
 class SettingsStore:
@@ -300,12 +532,34 @@ class SettingsStore:
             raise KeyError(f"未知配置分组: {section}")
         return await self._load_section(session, section)
 
+    async def merged_tts(self, session: AsyncSession) -> dict[str, Any]:
+        """合成一份「完整」的语音合成配置：公共项 + 当前通道的参数。
+
+        配置在库里分成三组（tts / tts_chattts / tts_aliyun）便于用户分别填写，
+        但提供者需要一个平坦的 TTSConfig，因此运行时在这里合并。
+        provider=mock 时没有专属分组，直接用公共项 + 默认值。
+        """
+        data = {section: await self._load_section(session, section) for section in CONFIG_MODELS}
+        merged = merge_tts_config(data)
+        if str(merged.get("provider") or "") not in {"chattts", "aliyun", "mock"}:
+            merged["provider"] = "chattts"
+        # 过滤元键 + 形状校验：越界/类型错在这里就暴露，而不是等到跑任务时
+        merged = {k: v for k, v in merged.items() if k in TTSConfig.all_field_names()}
+        _validate_merged_tts(merged)
+        return merged
+
     async def public(self, session: AsyncSession) -> dict[str, Any]:
         """脱敏后的完整配置，用于前端渲染。"""
         full = await self.load_all(session, use_cache=True)
-        return {
-            section: _mask_section(section, data) for section, data in full.items()
-        }
+        out: dict[str, Any] = {}
+        for section, data in full.items():
+            masked = _mask_section(section, data)
+            if section == "tts":
+                # 公共分组只回公共字段：_normalize 会把通道字段的默认值补回来，
+                # 原样返回会让「语音合成」页签重新出现两套参数（拆分就白做了）
+                masked = {k: v for k, v in masked.items() if k in SHARED_TTS_FIELDS}
+            out[section] = masked
+        return out
 
     async def describe(self) -> dict[str, Any]:
         """配置项元信息：分组、标签、默认值、密钥字段，供前端动态渲染表单。"""

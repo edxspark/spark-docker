@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { settingsApi } from '@/api'
+import { settingsApi, youtubeApi } from '@/api'
 import type { RuntimeInfo, SettingsSectionMeta, TestResult, Voice } from '@/types'
 
 type FieldType = 'text' | 'password' | 'number' | 'switch' | 'select' | 'textarea' | 'tags' | 'json'
@@ -63,16 +63,52 @@ const FIELD_META: Record<string, FieldMeta> = {
     label: '语音合成服务',
     type: 'select',
     options: [
-      { label: '阿里云智能语音交互（真实配音）', value: 'aliyun' },
+      { label: 'ChatTTS（本地服务，听感自然）', value: 'chattts' },
+      { label: '阿里云智能语音交互（云端，较机械）', value: 'aliyun' },
       { label: 'Mock（离线静音占位）', value: 'mock' },
     ],
-    help: 'Mock 会按文本长度生成等长静音音轨，用于验证对轴逻辑而无需消耗额度',
+    help: 'ChatTTS 需要本机先跑一个 ChatTTS 服务（如 ChatTTS-ui，默认端口 9966）；Mock 会按文本长度生成等长静音音轨，用于验证对轴逻辑而无需消耗额度',
   },
-  'tts.access_key_id': { label: 'AccessKey ID', type: 'password', help: '阿里云 RAM 用户的 AccessKey ID，建议使用只授予 ISI 权限的子账号' },
-  'tts.access_key_secret': { label: 'AccessKey Secret', type: 'password' },
-  'tts.app_key': { label: '项目 AppKey', type: 'password', help: '阿里云智能语音交互控制台创建项目后获得，语音合成必需' },
-  'tts.token': { label: '手工 Token', type: 'password', help: '可选项。填写后直接使用该 Token；留空则由 AK/SK 自动签发并缓存 24 小时' },
-  'tts.region': {
+  // ---- ChatTTS ----
+  'tts_chattts.chattts_base_url': {
+    label: 'ChatTTS 服务地址',
+    type: 'text',
+    help: '本地/内网地址，如 http://127.0.0.1:9966（ChatTTS-ui 默认端口）。配好后点本页「测试」会真合成一句试听',
+  },
+  'tts_chattts.chattts_api_path': {
+    label: '合成接口路径',
+    type: 'text',
+    help: '官方 webui 为 /tts（默认）；社区封装 ChatTTS-ui 为 /api/say，填错时会自动回退尝试另一个',
+  },
+  'tts_chattts.chattts_prompt': {
+    label: '风格提示词',
+    type: 'text',
+    help: '可填如 [oral_2][laugh_0]（数字越大越口语/笑声越多），影响全部字幕；留空则只下发语速档位',
+  },
+  'tts_chattts.voice_seed': {
+    label: '说话人种子',
+    type: 'number',
+    min: 0,
+    help: '关键项：流水线逐条字幕合成，固定种子才能让整支视频同一个音色（上游做法是 torch.manual_seed(种子)），否则会出现几十种声音',
+  },
+  'tts_chattts.speed': { label: '语速档位', type: 'number', min: 1, max: 9, help: '1~9 档，5 为默认；ChatTTS 内部会拼成 [speed_N] 提示词，不是倍速' },
+  'tts_chattts.temperature': { label: 'temperature', type: 'number', min: 0.01, max: 2, step: 0.05, help: '越高越有感情也越不稳定，建议 0.2~0.4' },
+  'tts_chattts.top_p': { label: 'top_p', type: 'number', min: 0.01, max: 1, step: 0.05, help: '采样范围，默认 0.7' },
+  'tts_chattts.top_k': { label: 'top_k', type: 'number', min: 1, max: 200, help: '采样候选数，默认 20' },
+  'tts_chattts.timeout': { label: '单次请求超时（秒）', type: 'number', min: 10, max: 1800, help: '首次合成本地模型需要加载，建议不少于 300 秒' },
+  'tts_chattts.gender_pool_size': {
+    label: '音色探测数量',
+    type: 'number',
+    min: 2,
+    max: 60,
+    help: 'ChatTTS 的音色没有性别标签，需要在首次使用时实测标注：探测 N 个音色、各自合成一句并测基频，结果缓存在 data/logs/chattts_voice_catalog.json。10 个约 25 秒，之后不再重复探测',
+  },
+  // ---- 阿里云 ----
+  'tts_aliyun.access_key_id': { label: 'AccessKey ID（阿里云）', type: 'password', help: '阿里云 RAM 用户的 AccessKey ID，建议使用只授予 ISI 权限的子账号' },
+  'tts_aliyun.access_key_secret': { label: 'AccessKey Secret', type: 'password' },
+  'tts_aliyun.app_key': { label: '项目 AppKey', type: 'password', help: '阿里云智能语音交互控制台创建项目后获得，语音合成必需' },
+  'tts_aliyun.token': { label: '手工 Token', type: 'password', help: '可选项。填写后直接使用该 Token；留空则由 AK/SK 自动签发并缓存 24 小时' },
+  'tts_aliyun.region': {
     label: '服务地域',
     type: 'select',
     options: [
@@ -80,8 +116,16 @@ const FIELD_META: Record<string, FieldMeta> = {
       { label: '华北2（北京）', value: 'cn-beijing' },
     ],
   },
-  'tts.voice': { label: '发音人', type: 'select', options: [], filterable: true, help: '选项来自内置的常用发音人列表，实际可用性取决于控制台开通情况' },
-  'tts.format': {
+  'tts_aliyun.voice_male': { label: '男声发音人', type: 'select', options: [], filterable: true, help: '「配音性别匹配」判定为男声时使用；留空则从内置清单里自动挑' },
+  'tts_aliyun.voice_female': { label: '女声发音人', type: 'select', options: [], filterable: true, help: '判定为女声时使用' },
+  'tts_aliyun.voice': {
+    label: '发音人（阿里云）',
+    type: 'select',
+    options: [],
+    filterable: true,
+    help: '仅阿里云通道使用。ChatTTS 的音色由上一行的「音色随机种子」决定，此项会被忽略',
+  },
+  'tts_aliyun.format': {
     label: '音频格式',
     type: 'select',
     options: [
@@ -90,7 +134,7 @@ const FIELD_META: Record<string, FieldMeta> = {
       { label: 'pcm', value: 'pcm' },
     ],
   },
-  'tts.sample_rate': {
+  'tts_aliyun.sample_rate': {
     label: '采样率',
     type: 'select',
     options: [
@@ -101,12 +145,39 @@ const FIELD_META: Record<string, FieldMeta> = {
     ],
     help: '部分音色仅支持 8000/16000/24000，若合成报错请下调',
   },
-  'tts.volume': { label: '音量', type: 'number', min: 0, max: 100 },
-  'tts.speech_rate': { label: '语速', type: 'number', min: -500, max: 500, help: '范围 -500~500，正值更快。中文变长时可适当调高' },
-  'tts.pitch_rate': { label: '语调', type: 'number', min: -500, max: 500, help: '范围 -500~500，正值更高' },
-  'tts.gain_db': { label: '输出增益（dB）', type: 'number', min: -20, max: 20, step: 0.5 },
-  'tts.max_chars_per_request': { label: '单请求字符上限', type: 'number', min: 50, max: 300, help: '阿里云单次请求上限 300 字符，超长文本会自动按标点切分后拼接' },
-  'tts.concurrency': { label: '合成并发数', type: 'number', min: 1, max: 16, help: '过高可能触发限流（错误码 429）' },
+  'tts_aliyun.volume': { label: '音量', type: 'number', min: 0, max: 100 },
+  'tts_aliyun.speech_rate': { label: '语速', type: 'number', min: -500, max: 500, help: '范围 -500~500，正值更快。中文变长时可适当调高' },
+  'tts_aliyun.pitch_rate': { label: '语调', type: 'number', min: -500, max: 500, help: '范围 -500~500，正值更高' },
+  'tts_aliyun.gain_db': { label: '输出增益（dB）', type: 'number', min: -20, max: 20, step: 0.5 },
+  'tts.voice_gender': {
+    label: '配音性别匹配',
+    type: 'select',
+    options: [
+      { label: '自动判断（推荐）', value: 'auto' },
+      { label: '关闭（沿用各通道音色配置）', value: 'off' },
+      { label: '强制男声', value: 'male' },
+      { label: '强制女声', value: 'female' },
+    ],
+    help: '自动：先用基频判断原视频说话人性别（男声 85~180Hz / 女声 165~255Hz），再用同性别音色配音——男配男声、女配女声',
+  },
+  'tts.gender_fallback': {
+    label: '判断失败时的回退',
+    type: 'select',
+    options: [
+      { label: '按女声配音', value: 'female' },
+      { label: '按男声配音', value: 'male' },
+      { label: '不换音色', value: 'off' },
+    ],
+    help: '原视频基本没人声、或声音太轻/太嘈杂导致判断不出来时用这个兜底',
+  },
+  'tts.max_chars_per_request': { label: '单请求字符上限', type: 'number', min: 50, max: 300, help: '单次请求的文本上限，超长文本会自动按标点切分后拼接（阿里云通道上限 300）' },
+  'tts.concurrency': {
+    label: '合成并发数',
+    type: 'number',
+    min: 1,
+    max: 16,
+    help: '阿里云通道过高会触发限流（429）；ChatTTS 是本地 CPU 推理，实测 1→2 提升明显（2.42s→1.64s/条），4 之后基本饱和（1.57s/条），建议 2',
+  },
 
   // 语音识别（无字幕兜底）
   'asr.provider': {
@@ -316,6 +387,76 @@ const FIELD_META: Record<string, FieldMeta> = {
     })),
     help: '越慢压缩率越高。medium 为平衡点，veryfast 可显著缩短渲染时间',
   },
+
+  // 统一开头语
+  'intro.enabled': {
+    label: '启用统一开头语',
+    type: 'switch',
+    help: '开启后，每支成片开头先播报这段文案（配音 + 中文字幕），随后才进入正片内容',
+  },
+  'intro.text': {
+    label: '开头语文案',
+    type: 'textarea',
+    help: '建议 40 字以内。会单独合成一段配音并按实际时长把正片整体后移，因此文案越长成片开头越长',
+  },
+  'intro.gap_seconds': {
+    label: '播报后停顿（秒）',
+    type: 'number',
+    min: 0,
+    max: 10,
+    step: 0.1,
+    help: '开头语播完到正片开始之间的留白，0.5~1 秒听感更自然',
+  },
+  'intro.show_in_subtitle': {
+    label: '开头语显示字幕',
+    type: 'switch',
+    help: '关闭后仍会播报配音，只是不在画面上烧录这段字幕',
+  },
+  'intro.card_mode': {
+    label: '开头画面',
+    type: 'select',
+    options: [
+      { label: '自动生成科技感标题卡（推荐）', value: 'auto' },
+      { label: '不使用（开头语期间冻结首帧）', value: 'none' },
+      { label: '使用我自己的图片', value: 'custom' },
+    ],
+    help: '播报开头语时显示的画面。自动生成会按成片分辨率渲染一张深色科技风标题卡',
+  },
+  'intro.card_image': {
+    label: '自定义图片路径',
+    type: 'text',
+    help: '仅「使用我自己的图片」时生效；填本机绝对路径，如 /Users/you/Pictures/intro.png。文件不存在会自动回退为自动生成',
+  },
+  'intro.card_layout': {
+    label: '开头画面版式',
+    type: 'select',
+    options: [
+      { label: '片头式 · 左对齐大标题（默认）', value: 'hero' },
+      { label: '画框式 · 居中大标题 + 细线画框', value: 'frame' },
+      { label: '品牌式 · 竖排色块 + 错落标题', value: 'band' },
+    ],
+    help: '三种版式的构图完全不同，点下方「预览开头画面」即可看到效果',
+  },
+  'intro.card_title': {
+    label: '卡片主标题',
+    type: 'text',
+    help: '建议与开头语第一句一致；过长会自动缩小并折行',
+  },
+  'intro.card_subtitle': {
+    label: '卡片副标题',
+    type: 'text',
+    help: '主标题下方的小字，写领域关键词即可',
+  },
+  'intro.card_brand': {
+    label: '卡片底部品牌名',
+    type: 'text',
+    help: '显示在卡片底部（自动转大写），留空则不显示',
+  },
+  'intro.card_font': {
+    label: '卡片字体',
+    type: 'text',
+    help: '留空自动选择系统中可用的中文字体，与成片字幕同一套探测逻辑',
+  },
 }
 
 const route = useRoute()
@@ -329,6 +470,86 @@ const runtime = ref<RuntimeInfo | null>(null)
 const paths = ref<Record<string, any> | null>(null)
 const testResult = ref<{ section: string; result: TestResult } | null>(null)
 const testDialog = ref(false)
+
+/** 统一开头语：开头画面预览 */
+const cardPreview = ref<{ image: string; renderer: string; width: number; height: number } | null>(null)
+const cardPreviewLoading = ref(false)
+
+// YouTube cookies：匿名下载会撞「确认你不是机器人」风控。
+// 登录成功后导出的是 yt-dlp 直接可用的 Netscape cookies.txt，下载器会自动使用。
+const ytLoggingIn = ref(false)
+const ytChecking = ref(false)
+const ytStatus = ref<Record<string, any> | null>(null)
+const ytMessage = ref('')
+
+const actionHint = computed(() => {
+  if (activeTab.value === 'intro') {
+    return '预览会用当前表单里的（含未保存的）内容渲染一张 9:16 标题卡'
+  }
+  if (activeTab.value === 'download') {
+    if (ytLoggingIn.value) return '已打开浏览器窗口，请登录 Google；登录完成后会自动导出并验证 cookies'
+    if (ytMessage.value) return ytMessage.value
+    if (ytStatus.value?.builtin_cookies_exists) {
+      return `已导出 cookies（${ytStatus.value.builtin_cookies_size} 字节），下载会自动使用它`
+    }
+    if (ytStatus.value?.configured_cookies_file) {
+      return '将使用你自己配置的 cookies 文件'
+    }
+    return 'YouTube 对匿名下载做了风控；登录一次即可，之后下载自动带上 cookies'
+  }
+  return '测试会发起一次真实调用（Mock 模式为本地模拟），用于确认密钥与网络是否可用'
+})
+
+async function loadYouTubeStatus() {
+  try {
+    ytStatus.value = await youtubeApi.status()
+  } catch {
+    /* 状态读取失败不该挡住设置页 */
+  }
+}
+
+async function startYouTubeLogin() {
+  ytLoggingIn.value = true
+  ytMessage.value = ''
+  try {
+    const res = await youtubeApi.login()
+    ElMessage.info(res.message)
+    // 轮询登录会话，直到 success / failed
+    for (let i = 0; i < 200; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 3000))
+      const snap = await youtubeApi.loginStatus()
+      if (snap?.message) ytMessage.value = snap.message
+      if (!snap?.running) {
+        if (snap?.status === 'success') {
+          ElMessage.success(snap.message || '登录成功，cookies 已导出')
+        } else {
+          ElMessage.error(snap?.message || '登录未完成')
+        }
+        break
+      }
+    }
+  } catch {
+    /* 拦截器已提示 */
+  } finally {
+    ytLoggingIn.value = false
+    ytMessage.value = ''
+    await loadYouTubeStatus()
+  }
+}
+
+async function checkYouTubeCookies() {
+  ytChecking.value = true
+  try {
+    const res = await youtubeApi.check()
+    ytMessage.value = res.message
+    ;(res.ok ? ElMessage.success : ElMessage.warning)(res.message)
+  } catch {
+    /* 拦截器已提示 */
+  } finally {
+    ytChecking.value = false
+  }
+}
+const cardPreviewDialog = ref(false)
 
 /** 表单数据：每个分组的字段值 */
 const form = reactive<Record<string, Record<string, any>>>({})
@@ -362,7 +583,7 @@ function fieldMeta(section: string, key: string, value: any): FieldMeta {
 }
 
 function optionsFor(section: string, key: string, meta: FieldMeta) {
-  if (`${section}.${key}` === 'tts.voice' || `${section}.${key}` === 'general.default_voice') {
+  if (`${section}.${key}` === 'tts_aliyun.voice' || `${section}.${key}` === 'general.default_voice') {
     return voices.value.map((voice) => ({ label: voice.name, value: voice.id }))
   }
   return meta.options || []
@@ -371,6 +592,54 @@ function optionsFor(section: string, key: string, meta: FieldMeta) {
 function fieldsOf(section: string): string[] {
   const data = form[section] || {}
   return Object.keys(data).filter((key) => !key.endsWith('__set'))
+}
+
+/**
+ * 语音合成的两套通道参数在库里是独立分组，但在界面上要合到「语音合成」一个页签里，
+ * 再用分区标题把「公共 / ChatTTS / 阿里云」分开——否则用户面对一长串字段，
+ * 分不清哪个参数属于哪个通道（这正是拆分前的问题）。
+ */
+const PROVIDER_GROUP_LABELS: Record<string, string> = {
+  tts: '公共设置',
+  tts_chattts: 'ChatTTS 参数（本地服务）',
+  tts_aliyun: '阿里云智能语音交互参数',
+}
+const TTS_MERGED_KEYS = ['tts', 'tts_chattts', 'tts_aliyun']
+
+function isTtsGroup(section: string): boolean {
+  return TTS_MERGED_KEYS.includes(section)
+}
+
+/** 当前选中的语音合成通道，决定哪个分区展开 */
+const activeTtsProvider = computed(() => String(form.tts?.provider || 'chattts'))
+
+function ttsSectionVisible(section: string): boolean {
+  if (section === 'tts') return true
+  if (section === 'tts_chattts') return activeTtsProvider.value === 'chattts'
+  if (section === 'tts_aliyun') return activeTtsProvider.value === 'aliyun'
+  return true
+}
+
+/** 页签结构：语音合成三组合成一页，其余分组各自一页 */
+const tabs = computed(() => {
+  const out: { key: string; label: string; sections: string[] }[] = []
+  for (const section of sections.value) {
+    if (isTtsGroup(section.key)) {
+      const merged = out.find((tab) => tab.key === 'tts')
+      const target = merged || { key: 'tts', label: '语音合成', sections: [] }
+      if (!merged) out.push(target)
+      target.sections.push(section.key)
+      continue
+    }
+    out.push({ key: section.key, label: section.label, sections: [section.key] })
+  }
+  return out
+})
+
+function activeTtsLabel(): string {
+  if (activeTtsProvider.value === 'chattts') return 'ChatTTS（本地服务）'
+  if (activeTtsProvider.value === 'aliyun') return '阿里云智能语音交互'
+  return 'Mock（离线静音占位）'
 }
 
 function initialValue(section: string, key: string, value: any): any {
@@ -515,8 +784,9 @@ async function resetSection() {
   }
 }
 
-async function runTest() {
-  const section = activeTab.value
+async function runTest(target?: string) {
+  // 合并页签（语音合成）测的是「当前通道」的完整参数，由后端按 provider 合并
+  const section = target || activeTab.value
   testing.value = section
   try {
     const result = await settingsApi.test(section)
@@ -531,6 +801,32 @@ async function runTest() {
     /* 拦截器已提示 */
   } finally {
     testing.value = null
+  }
+}
+
+/**
+ * 预览开头画面（未保存的改动也会一起带上，便于边调边看）。
+ * 后端按 9:16 竖屏渲染，返回 data URI 直接显示。
+ */
+async function previewIntroCard() {
+  cardPreviewLoading.value = true
+  try {
+    const intro = { ...(form.intro || {}) }
+    for (const key of Object.keys(intro)) {
+      if (key.endsWith('__set')) delete intro[key]
+    }
+    const result = await settingsApi.introCardPreview(intro, true)
+    cardPreview.value = {
+      image: result.image,
+      renderer: result.renderer,
+      width: result.width,
+      height: result.height,
+    }
+    cardPreviewDialog.value = true
+  } catch {
+    /* 拦截器已提示 */
+  } finally {
+    cardPreviewLoading.value = false
   }
 }
 
@@ -580,6 +876,7 @@ function runtimeTags() {
 onMounted(async () => {
   await load()
   loadRuntime()
+  loadYouTubeStatus()
 })
 </script>
 
@@ -636,48 +933,71 @@ onMounted(async () => {
     <!-- 配置分组 -->
     <div class="panel">
       <el-tabs v-model="activeTab">
-        <el-tab-pane v-for="section in sections" :key="section.key" :label="section.label" :name="section.key">
-          <el-form label-width="170px" label-position="left" class="config-form">
-            <el-form-item v-for="key in fieldsOf(section.key)" :key="key" :label="fieldMeta(section.key, key, form[section.key][key]).label">
+        <el-tab-pane v-for="tab in tabs" :key="tab.key" :label="tab.label" :name="tab.key">
+          <!-- 语音合成：当前通道的说明条 -->
+          <div v-if="tab.key === 'tts'" class="tts-current">
+            <el-tag effect="plain" type="primary">当前通道</el-tag>
+            <strong>{{ activeTtsLabel() }}</strong>
+            <span class="muted">下方只显示该通道的参数，切换通道后另一套参数会自动隐藏（配置不会被清空）</span>
+          </div>
+
+          <template v-for="groupKey in tab.sections" :key="groupKey">
+            <!-- 合并页签里的分区标题：把公共项与各通道参数分开 -->
+            <div v-if="tab.sections.length > 1 && ttsSectionVisible(groupKey)" class="tts-group">
+              <span class="tts-group-title">{{ PROVIDER_GROUP_LABELS[groupKey] || groupKey }}</span>
+              <span v-if="groupKey === 'tts_chattts'" class="muted tts-group-note">
+                需要本机先跑 ChatTTS 服务（./scripts/chattts.sh）
+              </span>
+              <span v-else-if="groupKey === 'tts_aliyun'" class="muted tts-group-note">
+                走云端接口，需 AccessKey 与项目 AppKey
+              </span>
+            </div>
+            <el-form
+              v-if="ttsSectionVisible(groupKey)"
+              label-width="170px"
+              label-position="left"
+              class="config-form"
+            >
+            <el-form-item v-for="key in fieldsOf(groupKey)" :key="key" :label="fieldMeta(groupKey, key, form[groupKey][key]).label">
               <!-- switch -->
               <el-switch
-                v-if="fieldMeta(section.key, key, form[section.key][key]).type === 'switch'"
-                v-model="form[section.key][key]"
+                v-if="fieldMeta(groupKey, key, form[groupKey][key]).type === 'switch'"
+                v-model="form[groupKey][key]"
               />
 
               <!-- number -->
               <el-input-number
-                v-else-if="fieldMeta(section.key, key, form[section.key][key]).type === 'number'"
-                v-model="form[section.key][key]"
-                :min="fieldMeta(section.key, key, form[section.key][key]).min"
-                :max="fieldMeta(section.key, key, form[section.key][key]).max"
-                :step="fieldMeta(section.key, key, form[section.key][key]).step ?? 1"
+                v-else-if="fieldMeta(groupKey, key, form[groupKey][key]).type === 'number'"
+                v-model="form[groupKey][key]"
+                :min="fieldMeta(groupKey, key, form[groupKey][key]).min"
+                :max="fieldMeta(groupKey, key, form[groupKey][key]).max"
+                :step="fieldMeta(groupKey, key, form[groupKey][key]).step ?? 1"
                 controls-position="right"
                 style="width: 200px"
               />
 
               <!-- password（密钥） -->
               <el-input
-                v-else-if="isSecret(section.key, key)"
-                v-model="form[section.key][key]"
+                v-else-if="isSecret(groupKey, key)"
+                v-model="form[groupKey][key]"
                 type="password"
                 show-password
                 clearable
                 style="width: 420px"
-                :placeholder="secretSet(section.key, key) ? '已配置，留空表示不修改' : '尚未配置'"
+                :placeholder="secretSet(groupKey, key) ? '已配置，留空表示不修改' : '尚未配置'"
               />
 
               <!-- select -->
               <el-select
-                v-else-if="fieldMeta(section.key, key, form[section.key][key]).type === 'select'"
-                v-model="form[section.key][key]"
-                :filterable="fieldMeta(section.key, key, form[section.key][key]).filterable"
-                :allow-create="fieldMeta(section.key, key, form[section.key][key]).allowCreate"
+                v-else-if="fieldMeta(groupKey, key, form[groupKey][key]).type === 'select'"
+                v-model="form[groupKey][key]"
+                :filterable="fieldMeta(groupKey, key, form[groupKey][key]).filterable"
+                :allow-create="fieldMeta(groupKey, key, form[groupKey][key]).allowCreate"
                 default-first-option
                 style="width: 420px"
               >
                 <el-option
-                  v-for="option in optionsFor(section.key, key, fieldMeta(section.key, key, form[section.key][key]))"
+                  v-for="option in optionsFor(groupKey, key, fieldMeta(groupKey, key, form[groupKey][key]))"
                   :key="String(option.value)"
                   :label="option.label"
                   :value="option.value"
@@ -686,8 +1006,8 @@ onMounted(async () => {
 
               <!-- tags -->
               <el-select
-                v-else-if="fieldMeta(section.key, key, form[section.key][key]).type === 'tags'"
-                v-model="form[section.key][key]"
+                v-else-if="fieldMeta(groupKey, key, form[groupKey][key]).type === 'tags'"
+                v-model="form[groupKey][key]"
                 multiple
                 filterable
                 allow-create
@@ -698,18 +1018,18 @@ onMounted(async () => {
 
               <!-- json -->
               <el-input
-                v-else-if="fieldMeta(section.key, key, form[section.key][key]).type === 'json'"
-                :model-value="typeof form[section.key][key] === 'string' ? form[section.key][key] : JSON.stringify(form[section.key][key], null, 2)"
+                v-else-if="fieldMeta(groupKey, key, form[groupKey][key]).type === 'json'"
+                :model-value="typeof form[groupKey][key] === 'string' ? form[groupKey][key] : JSON.stringify(form[groupKey][key], null, 2)"
                 type="textarea"
                 :rows="4"
                 style="width: 620px"
-                @update:model-value="(v: string) => (form[section.key][key] = v)"
+                @update:model-value="(v: string) => (form[groupKey][key] = v)"
               />
 
               <!-- textarea -->
               <el-input
-                v-else-if="fieldMeta(section.key, key, form[section.key][key]).type === 'textarea'"
-                v-model="form[section.key][key]"
+                v-else-if="fieldMeta(groupKey, key, form[groupKey][key]).type === 'textarea'"
+                v-model="form[groupKey][key]"
                 type="textarea"
                 :rows="4"
                 style="width: 620px"
@@ -718,23 +1038,70 @@ onMounted(async () => {
               <!-- text -->
               <el-input
                 v-else
-                v-model="form[section.key][key]"
+                v-model="form[groupKey][key]"
                 style="width: 520px"
                 clearable
               />
 
-              <div v-if="fieldHelp(section.key, key, fieldMeta(section.key, key, form[section.key][key]))" class="field-help muted">
-                {{ fieldHelp(section.key, key, fieldMeta(section.key, key, form[section.key][key])) }}
+              <div v-if="fieldHelp(groupKey, key, fieldMeta(groupKey, key, form[groupKey][key]))" class="field-help muted">
+                {{ fieldHelp(groupKey, key, fieldMeta(groupKey, key, form[groupKey][key])) }}
               </div>
             </el-form-item>
-          </el-form>
+            </el-form>
+          </template>
 
           <div class="section-actions">
-            <el-button :icon="'MagicStick'" :loading="testing === section.key" @click="runTest">
-              测试「{{ section.label }}」配置
+            <!-- 统一开头语：先看开头画面长什么样，再决定是否保存 -->
+            <el-button
+              v-if="tab.key === 'intro'"
+              type="primary"
+              plain
+              :icon="'Picture'"
+              :loading="cardPreviewLoading"
+              @click="previewIntroCard"
+            >
+              预览开头画面
+            </el-button>
+            <!-- YouTube 登录：匿名下载会撞「确认你不是机器人」风控，
+                 登录一次即可，导出的 cookies 会被下载器自动使用 -->
+            <template v-if="tab.key === 'download'">
+              <el-button
+                type="primary"
+                plain
+                :icon="'Key'"
+                :loading="ytLoggingIn"
+                @click="startYouTubeLogin"
+              >
+                登录 YouTube 并导出 cookies
+              </el-button>
+              <el-button
+                v-if="ytStatus?.builtin_cookies_exists"
+                :icon="'CircleCheck'"
+                :loading="ytChecking"
+                @click="checkYouTubeCookies"
+              >
+                验证 cookies
+              </el-button>
+            </template>
+            <!-- 语音合成：测试当前通道；两个通道都有测试入口，互不影响 -->
+            <el-button
+              v-if="tab.key === 'tts'"
+              :icon="'MagicStick'"
+              :loading="testing === 'tts'"
+              @click="runTest('tts')"
+            >
+              测试当前通道（{{ activeTtsLabel() }}）
+            </el-button>
+            <el-button
+              v-else-if="!isTtsGroup(tab.key) && tab.key !== 'intro'"
+              :icon="'MagicStick'"
+              :loading="testing === tab.key"
+              @click="runTest(tab.key)"
+            >
+              测试「{{ tab.label }}」配置
             </el-button>
             <span class="muted" style="font-size: 12.5px">
-              测试会发起一次真实调用（Mock 模式为本地模拟），用于确认密钥与网络是否可用
+              {{ actionHint }}
             </span>
           </div>
         </el-tab-pane>
@@ -773,10 +1140,42 @@ onMounted(async () => {
         <el-button type="primary" @click="testDialog = false">知道了</el-button>
       </template>
     </el-dialog>
+
+    <!-- 开头画面预览 -->
+    <el-dialog v-model="cardPreviewDialog" title="开头画面预览" width="460px" append-to-body>
+      <div v-if="cardPreview" class="card-preview">
+        <img :src="cardPreview.image" alt="开头画面预览" />
+        <div class="muted card-preview-tip">
+          渲染尺寸 {{ cardPreview.width }}x{{ cardPreview.height }}（9:16）·
+          渲染器 {{ cardPreview.renderer }}
+          <br />
+          成片里会按实际输出分辨率重新渲染，因此原比例与横屏成片的排版略有不同。
+        </div>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
+.card-preview {
+  text-align: center;
+}
+
+.card-preview img {
+  width: 100%;
+  max-width: 300px;
+  border-radius: 12px;
+  box-shadow: var(--spark-shadow);
+  display: block;
+  margin: 0 auto;
+}
+
+.card-preview-tip {
+  font-size: 12.5px;
+  margin-top: 12px;
+  line-height: 1.6;
+}
+
 .head-actions {
   display: flex;
   gap: 10px;
@@ -812,6 +1211,39 @@ onMounted(async () => {
 
 :deep(.el-form-item__content) {
   flex-wrap: wrap;
+}
+
+/* 语音合成页签：当前通道提示条 + 分区标题，避免两套参数混在一起分不清 */
+.tts-current {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  margin-bottom: 4px;
+  border-radius: 8px;
+  background: var(--spark-primary-9);
+  font-size: 13px;
+}
+
+.tts-group {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 18px 0 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--spark-border);
+}
+
+.tts-group-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--spark-text);
+}
+
+.tts-group-note {
+  font-size: 12px;
 }
 
 .section-actions {

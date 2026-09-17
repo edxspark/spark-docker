@@ -19,7 +19,9 @@ from app.providers.downloader.ytdlp import YtDlpDownloader
 from app.providers.publisher.douyin import DouyinPublisher, MockPublisher
 from app.providers.translator.deepseek import DeepSeekTranslator, MockTranslator
 from app.providers.tts.aliyun import AliyunTTS, MockTTS
+from app.providers.tts.chattts import ChatTTS
 from app.services.settings_store import (
+    merge_tts_config,
     ASRConfig,
     DownloadConfig,
     PublishConfig,
@@ -51,6 +53,8 @@ def build_translator(config: TranslatorConfig) -> BaseTranslator:
 def build_tts(config: TTSConfig) -> BaseTTS:
     if config.provider == "mock":
         return MockTTS(config)
+    if config.provider == "chattts":
+        return ChatTTS(config)
     return AliyunTTS(config)
 
 
@@ -75,7 +79,8 @@ def build_publisher(config: PublishConfig, account_file: Path) -> BasePublisher:
 
 def build_all(config: dict[str, Any], account_file: Path) -> dict[str, Any]:
     """一次性构建全部提供者，供任务执行器使用。"""
-    tts_config = TTSConfig(**config["tts"])
+    # 语音合成配置在库里分成三组（公共/chattts/aliyun），这里合并成一份完整的 TTSConfig
+    tts_config = TTSConfig(**merge_tts_config(config))
     asr_config = ASRConfig(**config.get("asr", {}))
 
     def asr_factory() -> BaseASR:

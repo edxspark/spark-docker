@@ -93,6 +93,10 @@ async def prepared(tmp_root, sample_video, sample_srt, monkeypatch):
                     "crf": 28,
                 },
                 "general": {"max_concurrent_tasks": 1},
+                # 统一开头语默认开启，但本文件关注「正片各阶段」本身；
+                # 开头语的行为与边界由 tests/test_intro.py 单独覆盖，
+                # 否则每个「句子数 == 配音段数」的断言都要 ±1，容易掩盖真实回归。
+                "intro": {"enabled": False},
             },
         )
 

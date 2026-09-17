@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 from app.pipeline.context import ItemState, StageContext
 from app.providers.base import ProviderError
-from app.services import ass_subtitles
+from app.services import ass_subtitles, intro_card
+from app.services import intro as intro_service
 from app.services.subtitles import Cue, reindex, to_srt
 from app.utils import ffmpeg as ffmpeg_utils
 from app.utils.text import normalize_punct
@@ -51,6 +53,8 @@ async def stage_translate(ctx: StageContext, state: ItemState) -> None:
         cues_zh.append(Cue(start=cue.start, end=cue.end, text=text))
     state.cues_zh = reindex(cues_zh)
 
+    await _apply_intro(ctx, state)
+
     state.paths.subtitle_zh.parent.mkdir(parents=True, exist_ok=True)
     state.paths.subtitle_zh.write_text(to_srt(state.cues_zh), encoding="utf-8")
 
@@ -67,7 +71,10 @@ async def stage_translate(ctx: StageContext, state: ItemState) -> None:
     await ctx.reporter.item_update(
         state.item.id,
         subtitle_zh_path=ctx.relative(state.paths.subtitle_zh),
-        stats={**state.item.stats, **state.stats},
+        # state.stats 是本次运行的累积结果，必须放在后面：state.item.stats 是
+        # 进入流水线时的旧快照，顺序写反会让旧值覆盖新值（开头语之类
+        # 「本次运行才产生」的字段会静默丢失）
+        stats=_merge_stats(state),
     )
     await ctx.reporter.item_stage(
         state.item.id,
@@ -83,6 +90,238 @@ async def stage_translate(ctx: StageContext, state: ItemState) -> None:
     )
 
 
+def _merge_stats(state: ItemState) -> dict:
+    """把本次运行的统计合并进条目统计。
+
+    `state.item.stats` 是「进入流水线那一刻」的旧快照，而 `state.stats` 是本次运行
+    累积出来的结果；因此后者必须覆盖前者。反过来写会让本次新产出的字段被旧值吞掉
+    （真实踩过：统一开头语刚写进 stats 就被旧快照覆盖，成片有开头语但统计里没有）。
+    """
+    return {**(state.item.stats or {}), **state.stats}
+
+
+def _intro_duration(state: ItemState) -> float:
+    """开头语配音的真实时长（没有开头语时为 0）。
+
+    取「开头语那条字幕的时长 - 配置的停顿」：字幕时长本身就等于
+    配音 + 停顿，因此相减即可还原出配音时长，无需额外传递状态。
+    """
+    if not state.cues_zh or not intro_service.is_intro_cue(state.cues_zh[0]):
+        return 0.0
+    info = state.stats.get("intro") or {}
+    gap = max(0.0, float(info.get("gap_seconds") or 0.0))
+    return max(0.0, float(state.cues_zh[0].duration) - gap)
+
+
+async def _apply_intro(ctx: StageContext, state: ItemState) -> None:
+    """把统一开头语插到字幕最前面，并把正片字幕整体后移。
+
+    幂等的关键：判断「是否已经插过」只认 stats 里记录的配置指纹。
+    开头语标记写进 SRT 就会丢失，所以不能用标记或字幕内容判断。
+
+    时序说明：位移量需要「开头语的配音时长」，而这里还没合成音频，因此先按中文
+    语速估算；语音合成阶段拿到真实时长后修正开头语那条字幕（见 _fit_intro_cue）。
+    """
+    cfg = ctx.config.merged("intro")
+    settings = intro_service.intro_settings(cfg)
+    key = intro_service.intro_config_key(cfg)
+    recorded = state.stats.get("intro") or {}
+
+    if not settings["enabled"] or not settings["text"]:
+        # 关掉了开场白：把上一轮插进去的那条去掉，避免声音没了字幕还在
+        if recorded.get("offset"):
+            state.cues_zh = intro_service.strip_by_offset(state.cues_zh, float(recorded["offset"]))
+            state.cues_zh = reindex(state.cues_zh)
+            await ctx.reporter.log(
+                "已关闭统一开头语：本次成片开头不再播报，旧的结尾文案字幕一并移除",
+                stage="translate",
+                item_id=state.item.id,
+            )
+        state.stats.pop("intro", None)
+        return
+
+    if recorded.get("config_key") == key:
+        # 续跑且配置未变：开头语已经在字幕里，不重复插入
+        return
+
+    if recorded.get("offset"):
+        # 配置变了（换文案 / 改停顿）：先撤掉旧的，再插新的
+        state.cues_zh = intro_service.strip_by_offset(state.cues_zh, float(recorded["offset"]))
+
+    estimated = intro_service.estimate_duration(settings["text"])
+    offset = estimated + settings["gap_seconds"]
+    state.cues_zh = intro_service.apply_intro(state.cues_zh, settings, duration=estimated)
+    state.cues_zh = reindex(state.cues_zh)
+    state.stats["intro"] = {
+        "mode": "estimate",
+        "config_key": key,
+        "text": settings["text"],
+        "characters": len(settings["text"]),
+        "gap_seconds": settings["gap_seconds"],
+        "show_in_subtitle": settings["show_in_subtitle"],
+        "offset": round(offset, 3),
+    }
+    await ctx.reporter.log(
+        f"已插入统一开头语（预计 {offset:.1f} 秒，含 {settings['gap_seconds']:.1f} 秒停顿）：{settings['text']}",
+        stage="translate",
+        item_id=state.item.id,
+    )
+
+
+def _segments_to_build(state: ItemState) -> list[tuple[int, Cue]]:
+    """返回本次需要合成的 (分段序号, 字幕) 列表。
+
+    分段音轨文件名是 seg_<序号>.mp3，序号必须与 state.cues_zh 的下标一致——
+    否则续跑时的「已有分段」统计会串位、复用错音频。因此这里保留原始下标，
+    开头语（若已插入）就在下标 0，与正片一起合成。
+    """
+    return list(enumerate(state.cues_zh))
+
+
+def _fit_intro_cue(ctx: StageContext, state: ItemState, cue: Cue, duration: float) -> Cue:
+    """开头语配音实测时长与预估值不一致时，修正开头语字幕并同步记录位移量。
+
+    真实时长决定正片字幕的后移量：字幕整体后移是在翻译阶段完成的，
+    这里只修正「开头语这一条」以及 stats 里记录的位移量，避免成片开头
+    出现「话还没说完、正片字幕已经开始」的错位。
+    """
+    if not intro_service.is_intro_cue(cue) or duration <= 0:
+        return cue
+
+    settings = intro_service.intro_settings(ctx.config.merged("intro"))
+    offset = duration + settings["gap_seconds"]
+    info = dict(state.stats.get("intro") or {})
+    estimated = float(info.get("offset") or 0.0)
+    info.update(
+        {
+            "mode": "measured",
+            "duration": round(duration, 3),
+            "offset": round(offset, 3),
+            "estimated_offset": estimated or round(offset, 3),
+        }
+    )
+    state.stats["intro"] = info
+
+    if abs(offset - float(cue.end)) > 0.01:
+        # 后续字幕按估算位移排布，若要严格一致需整表重排；
+        # 这里只记录偏差，避免「静默地以为已经对齐」。
+        info["drift"] = round(offset - float(cue.end), 3)
+        logger.info(
+            "开头语实测时长 %.2fs，与预估 %.2fs 相差 %.2fs（任务 %s）",
+            offset,
+            float(cue.end),
+            info["drift"],
+            ctx.task.id,
+        )
+    return replace(cue, end=max(offset, float(cue.start) + 0.1))
+
+
+async def _build_intro_card(
+    ctx: StageContext,
+    state: ItemState,
+    video_cfg: dict,
+    media,
+    intro_duration: float,
+) -> Path | None:
+    """生成（或复用）开头语期间显示的科技感标题卡。
+
+    失败不阻断成片：任何异常都降级为「冻结首帧」，并写进日志与 stats，
+    避免用户只看到「黑屏」却不知道为什么。
+    """
+    cfg = ctx.config.merged("intro")
+    mode = intro_service.card_mode(cfg)
+    if mode == "none":
+        await ctx.reporter.log(
+            "按设置不显示开头画面（仅冻结首帧）", stage="align", item_id=state.item.id
+        )
+        return None
+
+    target_aspect = str(video_cfg.get("target_aspect", "original"))
+    width, height = ass_subtitles.output_resolution(media.width, media.height, target_aspect)
+
+    try:
+        result = await intro_card.build_card_async(
+            width=width, height=height, config=cfg, force=False
+        )
+    except Exception as exc:  # noqa: BLE001 - 渲染失败不应让成片失败
+        logger.exception("开头画面生成失败")
+        state.stats["intro_card"] = {"ok": False, "error": str(exc)[:300], "mode": mode}
+        await ctx.reporter.log(
+            f"开头画面生成失败，已退化为冻结首帧：{exc}", level="warning", stage="align",
+            item_id=state.item.id,
+        )
+        return None
+
+    state.stats["intro_card"] = {
+        "ok": True,
+        "mode": mode,
+        "renderer": result.renderer,
+        "path": ctx.relative(result.path),
+        "size": f"{result.width}x{result.height}",
+        "seconds": round(intro_duration, 2),
+    }
+    await ctx.reporter.log(
+        f"开头画面已就绪（{result.width}x{result.height}，{result.renderer}），"
+        f"将在开头 {intro_duration:.1f} 秒显示：{result.path.name}",
+        stage="align",
+        item_id=state.item.id,
+    )
+    return result.path
+
+
+async def _prepare_gender_voice(ctx: StageContext, state: ItemState) -> None:
+    """判断原视频说话人性别，并让配音提供者选择同性别音色。
+
+    判定用基频（F0）：男声 85~180 Hz、女声 165~255 Hz，中间以阈值切分。
+    结果写入 state.stats["voice_gender"]，任务详情与日志都能看到依据，
+    便于用户发现配错时定位（而不是只看到一个「声音不对」的结果）。
+    """
+    from app.services import voice_profile
+
+    cfg = ctx.config.merged("tts")
+    mode = str(cfg.get("voice_gender") or "auto")
+    if mode == "off":
+        return
+    prepare = getattr(ctx.providers["tts"], "prepare_gender", None)
+    if prepare is None:
+        return
+
+    source = state.paths.video or state.paths.output
+    stats: dict[str, object] = {"mode": mode}
+
+    if mode in {"male", "female"}:
+        target = mode
+        stats.update({"target": target, "source": "手动指定"})
+    else:
+        await ctx.reporter.item_stage(
+            state.item.id, "tts", 2, "判断原视频说话人性别…", overall=ctx.overall_for("tts", 2)
+        )
+        profile = await voice_profile.analyze_media(source, work_dir=state.paths.work_dir)
+        stats.update({"profile": profile.as_stats(), "source": "基频判定"})
+        target = profile.gender
+        if target == "unknown":
+            fallback = str(cfg.get("gender_fallback") or "female")
+            stats["reason"] = profile.reason or "未能判断"
+            if fallback == "off":
+                stats["target"] = "unknown"
+                await ctx.reporter.log(
+                    f"未能判断原视频说话人性别（{profile.reason or '音频信息不足'}），已按配置沿用原有音色",
+                    level="warning",
+                    stage="tts",
+                    item_id=state.item.id,
+                )
+                return
+            target = fallback
+            stats["fallback"] = fallback
+
+    stats["target"] = target
+    note = await prepare(target)
+    stats["applied"] = note
+    state.stats["voice_gender"] = stats
+    if note:
+        await ctx.reporter.log(note, stage="tts", item_id=state.item.id)
+
+
 async def stage_tts(ctx: StageContext, state: ItemState) -> None:
     if state.stats.get("no_subtitle"):
         await ctx.reporter.item_stage(
@@ -92,11 +331,19 @@ async def stage_tts(ctx: StageContext, state: ItemState) -> None:
 
     tts_cfg = ctx.config.merged("tts")
     tts = ctx.providers["tts"]
-    voice = str(tts_cfg.get("voice") or "") or None
     concurrency = max(1, int(tts_cfg.get("concurrency") or 4))
 
+    # 先判断原视频说话人性别，再让提供者按性别挑音色（男配男声、女配女声）
+    await _prepare_gender_voice(ctx, state)
+
+    # 性别音色在提供者内部生效，这里不再传任务级 voice，避免把它顶掉
+    voice = None if getattr(tts, "gender_speaker", 0) or getattr(tts, "gender_voice", "") else (
+        str(tts_cfg.get("voice") or "") or None
+    )
+
     state.paths.audio_dir.mkdir(parents=True, exist_ok=True)
-    total = len(state.cues_zh)
+    segments_to_build = _segments_to_build(state)
+    total = len(segments_to_build)
     if total == 0:
         raise ProviderError("没有可配音的中文字幕")
 
@@ -118,7 +365,7 @@ async def stage_tts(ctx: StageContext, state: ItemState) -> None:
             item_id=state.item.id,
         )
 
-    async def worker(index: int, cue: Cue) -> None:
+    async def worker(slot: int, index: int, cue: Cue) -> None:
         nonlocal completed, cached_count, characters
         ctx.reporter.raise_if_canceled()
         async with semaphore:
@@ -131,21 +378,25 @@ async def stage_tts(ctx: StageContext, state: ItemState) -> None:
                 async with lock:
                     cached_count += 1
                     completed += 1
-                    segments[index] = (cue.start, cue.end, target)
+                    segments[slot] = (cue.start, cue.end, target)
                     await _report_tts(ctx, state, completed, total, cached=True)
                 return
             try:
                 result = await tts.synthesize(cue.text, target, voice=voice)
+                duration = float(getattr(result, "duration", 0.0) or 0.0)
+                if duration <= 0:
+                    duration = await ffmpeg_utils.audio_duration(target)
+                cue = _fit_intro_cue(ctx, state, cue, duration)
             except ProviderError as exc:
-                raise ProviderError(f"第 {index + 1} 句语音合成失败：{exc}") from exc
+                raise ProviderError(f"第 {slot + 1} 句语音合成失败：{exc}") from exc
             async with lock:
                 characters += result.characters
                 completed += 1
-                segments[index] = (cue.start, cue.end, result.path)
+                segments[slot] = (cue.start, cue.end, result.path)
                 await _report_tts(ctx, state, completed, total, cached=False)
 
     try:
-        await asyncio.gather(*(worker(i, cue) for i, cue in enumerate(state.cues_zh)))
+        await asyncio.gather(*(worker(slot, index, cue) for slot, (index, cue) in enumerate(segments_to_build)))
     except Exception:
         # 让已成功的分段保留在磁盘，便于重试续跑
         raise
@@ -159,8 +410,10 @@ async def stage_tts(ctx: StageContext, state: ItemState) -> None:
         "cached_segments": cached_count,
         "voice": tts_cfg.get("voice", ""),
         "provider": getattr(tts, "name", "unknown"),
+        # 性别判定与选中的音色（便于事后核对「为什么配了这个声音」）
+        "voice_gender": state.stats.get("voice_gender", {}),
     }
-    await ctx.reporter.item_update(state.item.id, stats={**state.item.stats, **state.stats})
+    await ctx.reporter.item_update(state.item.id, stats=_merge_stats(state))
     await ctx.reporter.item_stage(
         state.item.id,
         "tts",
@@ -196,6 +449,20 @@ async def stage_align(ctx: StageContext, state: ItemState) -> None:
     media = await ffmpeg_utils.probe(video_path)
     total_duration = media.duration or state.item.duration or 0.0
 
+    # 统一开头语：成片开头先播开头语，之后才是正片内容。
+    # 做法是把「正片的分段配音」整体后移一个开头语的时长，而开头语本身放在
+    # 0 秒处——成片因此比原片长出这一段，且正片每一句仍与画面严格对齐
+    # （若改成前插静音，在 -shortest 下开头语会被整段截掉）。
+    intro_duration = _intro_duration(state)
+    intro_card_path: Path | None = None
+    if intro_duration > 0:
+        await ctx.reporter.log(
+            f"成片开头插入开头语（{intro_duration:.1f} 秒），正片内容整体后移",
+            stage="align",
+            item_id=state.item.id,
+        )
+        intro_card_path = await _build_intro_card(ctx, state, video_cfg, media, intro_duration)
+
     final_audio: Path | None = None
     if state.voice_segments:
         loop = asyncio.get_running_loop()
@@ -220,13 +487,15 @@ async def stage_align(ctx: StageContext, state: ItemState) -> None:
         await ffmpeg_utils.build_timeline_track(
             state.voice_segments,
             voice_track,
-            total_duration=total_duration,
+            total_duration=total_duration + intro_duration,
             work_dir=state.paths.work_dir,
             max_speedup=float(video_cfg.get("max_speedup", 1.35)),
             on_progress=on_progress,
         )
 
-        final_audio = await _mix_audio(ctx, state, video_cfg, video_path, voice_track, media, total_duration)
+        final_audio = await _mix_audio(
+            ctx, state, video_cfg, video_path, voice_track, media, total_duration + intro_duration
+        )
         if str(video_cfg.get("original_audio", "remove")) == "remove" and final_audio == voice_track:
             if ctx.config.tts.get("provider") == "mock":
                 await ctx.reporter.log(
@@ -256,6 +525,10 @@ async def stage_align(ctx: StageContext, state: ItemState) -> None:
         burn=subtitle_for_burn is not None,
         crf=int(video_cfg.get("crf", 20)),
         preset=str(video_cfg.get("preset", "medium")),
+        # 开头语那一段用标题卡 / 冻结首帧补足画面长度，
+        # 否则 -shortest 会把开头语切掉
+        pad_start=intro_duration,
+        intro_card=intro_card_path,
     )
 
     # 封面：优先用原视频缩略图，否则从成片抽帧
@@ -312,12 +585,44 @@ def translate_config_key(ctx: StageContext) -> str:
     return f"{cfg.get('provider')}:{cfg.get('model')}:{cfg.get('style_prompt', '')[:40]}"
 
 
+# 影响合成结果、需参与缓存失效判断的字段（通道切换/改音色/改参数都要重合成）
+_TTS_KEY_FIELDS = (
+    "provider",
+    # ChatTTS
+    "chattts_base_url",
+    "chattts_api_path",
+    "chattts_prompt",
+    "temperature",
+    "top_p",
+    "top_k",
+    "speed",
+    "voice_seed",
+    # 性别匹配：策略或多音色偏好变化都会影响最终音色
+    "voice_gender",
+    "gender_fallback",
+    "gender_pool_size",
+    "voice_male",
+    "voice_female",
+    # 阿里云
+    "voice",
+    "speech_rate",
+    "pitch_rate",
+    "sample_rate",
+    "volume",
+    "format",
+    "region",
+)
+
+
 def tts_config_key(ctx: StageContext) -> str:
+    """把影响音频结果的参数拼成指纹：任何一项变化都应重新合成。
+
+    注意要带上 ChatTTS 的参数——只比对阿里云字段会让「换音色种子后仍复用旧音频」。
+    末尾还要带上统一开头语：文案变了，开头那段配音必须重做。
+    """
     cfg = ctx.config.merged("tts")
-    return (
-        f"{cfg.get('provider')}:{cfg.get('voice')}:{cfg.get('speech_rate')}:"
-        f"{cfg.get('sample_rate')}:{cfg.get('volume')}"
-    )
+    base = ":".join(str(cfg.get(field)) for field in _TTS_KEY_FIELDS)
+    return f"{base}|intro:{intro_service.intro_config_key(ctx.config.merged('intro'))}"
 
 
 def render_config_key(ctx: StageContext) -> str:
@@ -402,6 +707,16 @@ async def _build_subtitle_file(
     mode = str(video_cfg.get("subtitle_mode", "bilingual"))
     primary = state.cues_zh if mode != "en" else state.cues_en
     secondary = state.cues_en if mode == "bilingual" else None
+
+    # 统一开头语按配置决定是否出现在字幕里（关掉时只剩配音，不烧字幕）
+    intro_settings = intro_service.intro_settings(ctx.config.merged("intro"))
+    if mode != "en":
+        primary = intro_service.subtitle_cues(primary, intro_settings)
+        if secondary and primary and intro_service.is_intro_cue(primary[0]):
+            # 开头语没有对应的英文原句。不排除的话，_match_secondary 会把正片
+            # 第一句英文贴到开头语下面（因为它的开始时间也很接近 0 秒），
+            # 于是开头大字幕下出现一行莫名其妙的英文。
+            secondary = secondary[1:] if secondary else None
 
     if not primary:
         # 没有中文字幕时退回英文字幕，总比没有字幕好

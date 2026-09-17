@@ -125,6 +125,19 @@ export const settingsApi = {
 
   test: (section: string) =>
     http.post<TestResult>(`/settings/test/${section}`, null, { timeout: 180000 }).then((r) => r.data),
+
+  /** 预览「统一开头语」的开头画面（返回 data URI，可在保存前先看效果） */
+  introCardPreview: (intro: Record<string, any>, force = false) =>
+    http
+      .post<{
+        ok: boolean
+        renderer: string
+        width: number
+        height: number
+        image: string
+        message: string
+      }>('/settings/intro/card', { intro, force }, { timeout: 120000 })
+      .then((r) => r.data),
 }
 
 // ---------------------------------------------------------------- 抖音
@@ -141,6 +154,20 @@ export const douyinApi = {
   logout: () => http.post<{ message: string }>('/douyin/logout').then((r) => r.data),
 
   qrcodeUrl: () => `/api/douyin/login/qrcode?t=${Date.now()}`,
+}
+
+// YouTube 登录：匿名下载会撞「确认你不是机器人」风控，需要 cookies。
+// 这一步开浏览器登录一次，登录态会被导出成 yt-dlp 能用的 cookies.txt 并自动验证。
+export const youtubeApi = {
+  status: () => http.get<Record<string, any>>('/youtube/status').then((r) => r.data),
+
+  login: () => http.post<{ message: string }>('/youtube/login').then((r) => r.data),
+
+  loginStatus: () => http.get<Record<string, any>>('/youtube/login/status').then((r) => r.data),
+
+  check: () => http.post<{ ok: boolean; message: string }>('/youtube/check').then((r) => r.data),
+
+  logout: () => http.post<{ message: string }>('/youtube/logout').then((r) => r.data),
 }
 
 // ---------------------------------------------------------------- 统计
